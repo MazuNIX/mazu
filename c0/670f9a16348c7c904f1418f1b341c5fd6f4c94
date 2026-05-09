@@ -1,0 +1,41 @@
+.ci/check-format.sh
+  s_cfa48a0a8b3817::t_f332448ab3ea67 7-35
+include/mazu/net/mac_addr.h
+  s_cfa48a0a8b3817::t_c18f0520932002 66
+include/mazu/buddy.h
+  s_cfa48a0a8b3817::t_c18f0520932002 50
+.github/workflows/main.yml
+  s_cfa48a0a8b3817::t_9049abf53620c0 3-250
+.gitignore
+  s_cfa48a0a8b3817::t_e95826cd7c414c 10-11
+.ci/check-cppcheck.sh
+  s_cfa48a0a8b3817::t_e4d21ad7d6f7ac 9-28
+include/mazu/arena.h
+  s_cfa48a0a8b3817::t_c18f0520932002 97
+kernel/rtcfg.h
+  s_cfa48a0a8b3817::t_c18f0520932002 24
+include/mazu/alloc.h
+  s_cfa48a0a8b3817::t_c18f0520932002 42
+.ci/check-security.sh
+  s_cfa48a0a8b3817::t_bf62074222cfd6 10-59
+.ci/riscv-toolchain.txt
+  s_cfa48a0a8b3817::t_b0f27d73d6c915 1-18
+include/mazu/errordef.h
+  s_cfa48a0a8b3817::t_c18f0520932002 204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c0670f9a16348c7c904f1418f1b341c5fd6f4c94",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
