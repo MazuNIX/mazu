@@ -1,0 +1,94 @@
+.github/workflows/main.yml
+  s_cfa48a0a8b3817::t_9049abf53620c0 3-7,20-28,34-41,47-138,140-141,156-167,169-174,179,194-242,246
+  s_cfa48a0a8b3817::t_b9e00badd4127c 8-19
+  s_cfa48a0a8b3817::t_230fe7f170ec8e 29-33
+  s_cfa48a0a8b3817::t_30c5df59bf7c00 42-45
+  s_cfa48a0a8b3817::t_5cc0fa1fd4ed51 46
+  s_cfa48a0a8b3817::t_12ff9636908a90 139,142-155,168,175-178,180-193
+  s_cfa48a0a8b3817::t_83bd781a94da70 243-245
+  s_cfa48a0a8b3817::t_0c6a4439b8ea2a 247-252,256,260
+  s_cfa48a0a8b3817::t_f3b214a8f86bc4 275
+  s_cfa48a0a8b3817::t_e99c3ecd368564 279-284,286,309,311-314,316,327
+  s_cfa48a0a8b3817::t_5c3f15a25d1f80 285,318
+  s_cfa48a0a8b3817::t_fdfe3d5fa1204b 287-308,315,317,319-324,328-330
+  s_cfa48a0a8b3817::t_8e71da13d9cc35 310
+  s_cfa48a0a8b3817::t_1b4ac80bc1223f 361
+  s_cfa48a0a8b3817::t_daf9dd30ada97b 387
+  s_cfa48a0a8b3817::t_4922b645f34b04 408-412
+.ci/check-cppcheck.sh
+  s_cfa48a0a8b3817::t_e4d21ad7d6f7ac 9-28
+tests/host/mazu/asm.h
+  s_cfa48a0a8b3817::t_62c449a157eae4 14-17,20,30-31
+lib/builtins.c
+  s_cfa48a0a8b3817::t_2d55e7913f67da 1-18,22-26,42
+  s_cfa48a0a8b3817::t_86600333bfe2f7 19-21,27-41,43-44,53-67,69-70
+  s_cfa48a0a8b3817::t_1c50f1844bb1f3 45-52
+.gitignore
+  s_cfa48a0a8b3817::t_e95826cd7c414c 10-11
+.ci/check-newline.sh
+  s_cfa48a0a8b3817::t_03dd9c1f3e9d24 8-10
+.ci/test-tap.sh
+  s_cfa48a0a8b3817::t_ea276d21f65f98 1-48,58-61,67-101
+  s_cfa48a0a8b3817::t_f26500f9731fd2 49-57,62-66
+.ci/check-format.sh
+  s_cfa48a0a8b3817::t_f332448ab3ea67 7-35
+configs/ci_defconfig
+  s_cfa48a0a8b3817::t_db9d46292654d5 1-10
+  s_cfa48a0a8b3817::t_987071e6bc7f1c 11-19
+kernel/rtcfg.h
+  s_cfa48a0a8b3817::t_c18f0520932002 24
+include/mazu/errordef.h
+  s_cfa48a0a8b3817::t_c18f0520932002 204
+include/mazu/alloc.h
+  s_cfa48a0a8b3817::t_c18f0520932002 42
+include/mazu/net/mac_addr.h
+  s_cfa48a0a8b3817::t_c18f0520932002 66
+tests/host/test_main.c
+  s_cfa48a0a8b3817::t_62c449a157eae4 38
+tests/tests-barrier.c
+  ai_agent 100-103,148-150
+  s_cfa48a0a8b3817::t_a466f7e13f1b9a 104-107
+  s_cfa48a0a8b3817::t_706aa151ea2a8f 147
+.ci/qemu.txt
+  s_cfa48a0a8b3817::t_2a9dae80c806bb 1-13
+.ci/check-security.sh
+  s_cfa48a0a8b3817::t_bf62074222cfd6 10-22,30,44,47-48,50-51,53-59
+  s_cfa48a0a8b3817::t_4637b5e7520f0b 23-28
+  s_cfa48a0a8b3817::t_fc21420d461020 29,36-37
+  s_cfa48a0a8b3817::t_745859b2499867 31-35,38-43,45-46,49,52
+.cppcheck-suppress
+  s_cfa48a0a8b3817::t_5c837a796bebfe 11-15
+  s_cfa48a0a8b3817::t_e103ee116deed5 17
+Makefile
+  s_cfa48a0a8b3817::t_1b8ab6c6121c70 116
+  s_cfa48a0a8b3817::t_2a4c336e0304f5 190
+include/mazu/buddy.h
+  s_cfa48a0a8b3817::t_c18f0520932002 50
+.ci/riscv-toolchain.txt
+  s_cfa48a0a8b3817::t_b0f27d73d6c915 1-18
+.ci/cleanup-tap.sh
+  s_cfa48a0a8b3817::t_68829dcf5bd34e 1-8,10,15,23
+  s_cfa48a0a8b3817::t_0022d8c562b1b0 9,18-22
+  s_cfa48a0a8b3817::t_1e24925d690c31 11-14,16-17
+include/mazu/arena.h
+  s_cfa48a0a8b3817::t_c18f0520932002 97
+.ci/setup-tap.sh
+  s_cfa48a0a8b3817::t_bdb99290409dff 1,6,15,17-21,25-38
+  s_cfa48a0a8b3817::t_1cd220f5a8090f 2-5,7-14,16,22-24,40-44,49,52-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "279458cc886be0aea80b47750d1df06970d7ead5",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
