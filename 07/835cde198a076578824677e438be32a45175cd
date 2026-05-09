@@ -1,0 +1,32 @@
+.ci/check-security.sh
+  s_cfa48a0a8b3817::t_4637b5e7520f0b 23-28
+  s_cfa48a0a8b3817::t_fc21420d461020 29,36-37
+  s_cfa48a0a8b3817::t_745859b2499867 31-35,38-43,45-46,49,52
+.ci/qemu.txt
+  s_cfa48a0a8b3817::t_2a9dae80c806bb 1-13
+.github/workflows/main.yml
+  s_cfa48a0a8b3817::t_4922b645f34b04 408-412
+  s_cfa48a0a8b3817::t_fdfe3d5fa1204b 287-308,315,317,319-324,328-330
+  s_cfa48a0a8b3817::t_30c5df59bf7c00 42-45
+  s_cfa48a0a8b3817::t_0c6a4439b8ea2a 247-252,256,260
+.ci/cleanup-tap.sh
+  s_cfa48a0a8b3817::t_1e24925d690c31 11-14,16-17
+.ci/check-newline.sh
+  s_cfa48a0a8b3817::t_03dd9c1f3e9d24 8-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "07835cde198a076578824677e438be32a45175cd",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
