@@ -1,0 +1,29 @@
+Makefile
+  s_cfa48a0a8b3817::t_1b8ab6c6121c70 116
+tests/host/mazu/asm.h
+  s_cfa48a0a8b3817::t_62c449a157eae4 14-17,20,30-31
+tests/host/test_main.c
+  s_cfa48a0a8b3817::t_62c449a157eae4 38
+.cppcheck-suppress
+  s_cfa48a0a8b3817::t_5c837a796bebfe 11-15
+lib/builtins.c
+  s_cfa48a0a8b3817::t_2d55e7913f67da 1-42,57-58,61-64,67
+  s_cfa48a0a8b3817::t_dc038b37785212 59-60,65-66
+  s_cfa48a0a8b3817::t_1c50f1844bb1f3 43-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "22f56c7fc5a3c9d803643968c5748bbb19dabc55",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
