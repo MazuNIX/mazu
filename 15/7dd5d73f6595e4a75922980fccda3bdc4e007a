@@ -1,0 +1,30 @@
+.ci/setup-tap.sh
+  s_cfa48a0a8b3817::t_bdb99290409dff 1-38
+tests/tests-barrier.c
+  ai_agent 100-103,148-150
+.ci/cleanup-tap.sh
+  s_cfa48a0a8b3817::t_68829dcf5bd34e 1-23
+.ci/test-tap.sh
+  s_cfa48a0a8b3817::t_ea276d21f65f98 1-101
+.github/workflows/main.yml
+  s_cfa48a0a8b3817::t_f3b214a8f86bc4 275,281-298
+  s_cfa48a0a8b3817::t_d4a728f37bfbe1 308
+configs/ci_defconfig
+  s_cfa48a0a8b3817::t_db9d46292654d5 1-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "157dd5d73f6595e4a75922980fccda3bdc4e007a",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
