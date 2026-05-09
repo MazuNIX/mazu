@@ -1,0 +1,23 @@
+.ci/cleanup-tap.sh
+  s_cfa48a0a8b3817::t_0022d8c562b1b0 9,16-22
+.ci/setup-tap.sh
+  s_cfa48a0a8b3817::t_1cd220f5a8090f 2-5,7-14,16,22-24,40-44,49,52-89
+.github/workflows/main.yml
+  s_cfa48a0a8b3817::t_c93c9ac5a653c4 151-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "e99d4b841419d51954de71e7e967e6a502cde134",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
