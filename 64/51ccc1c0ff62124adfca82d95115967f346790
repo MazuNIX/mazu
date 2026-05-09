@@ -1,0 +1,19 @@
+lib/builtins.c
+  s_cfa48a0a8b3817::t_86600333bfe2f7 19-21,27-41,43-44,53-67,69-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6451ccc1c0ff62124adfca82d95115967f346790",
+  "prompts": {},
+  "sessions": {
+    "s_cfa48a0a8b3817": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b6e6cfe-4d29-473f-ac13-c1000075a8c8",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
