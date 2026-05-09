@@ -1,0 +1,22 @@
+kernel/net/tcp.c
+  s_b1a6c1de66b94b::t_bc5bd47b78cedd 2563,2565-2567
+kernel/proc/syscall.c
+  s_b1a6c1de66b94b::t_07f4d03d7b0485 479-482,484
+  s_b1a6c1de66b94b::t_0d23575202648f 41-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "0424dbdce11152107c55c259451cd658e978e91a",
+  "prompts": {},
+  "sessions": {
+    "s_b1a6c1de66b94b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59d7df78-b1a3-470a-a5f6-c2c73b48b5ab",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
