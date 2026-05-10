@@ -1,0 +1,21 @@
+scripts/analyze.sh
+  s_35044162747ed2::t_ce40da273cad0f 174-178,187-192,198
+.github/workflows/main.yml
+  s_35044162747ed2::t_3c515bc663a862 174-175,178-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6aadad85ac60a97804ccb27c7dae49884699e7c1",
+  "prompts": {},
+  "sessions": {
+    "s_35044162747ed2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cd2a0ef-bfe0-4009-b265-7f39c629d25e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
