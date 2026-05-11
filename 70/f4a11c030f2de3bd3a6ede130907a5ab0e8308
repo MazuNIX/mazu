@@ -1,0 +1,23 @@
+kernel/sched/deadline.c
+  s_35596cb3beefb0::t_b3452362be95db 127-134,136,138-148
+tests/tests-sched.c
+  s_35596cb3beefb0::t_92803f8b85d9a3 90-91,93,98,101,106-107,142-143,148-154
+Makefile
+  s_35596cb3beefb0::t_7b5229940baa1a 289-290
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "70f4a11c030f2de3bd3a6ede130907a5ab0e8308",
+  "prompts": {},
+  "sessions": {
+    "s_35596cb3beefb0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "869ef9c9-10d0-4245-9834-7b893032a1f0",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
