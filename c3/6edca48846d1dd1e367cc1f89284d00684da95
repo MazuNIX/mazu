@@ -1,0 +1,11 @@
+docs/pse51-matrix.md
+  ai_agent 1-285
+README.md
+  ai_agent 39-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c36edca48846d1dd1e367cc1f89284d00684da95",
+  "prompts": {}
+}
