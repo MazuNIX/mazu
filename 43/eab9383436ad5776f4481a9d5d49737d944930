@@ -1,0 +1,44 @@
+rootfs/web/js/common.js
+  s_27be9745e357a4::t_830959b29b4c07 87-88,91-98
+kernel/proc/signal.c
+  s_27be9745e357a4::t_66f47ceb7d89c6 404-409
+kernel/timer/posix_timer.c
+  s_27be9745e357a4::t_86b9dba433395a 92
+user/net/web.c
+  s_27be9745e357a4::t_bb8fc5a1c505a5 52
+rootfs/web/js/shell.js
+  s_27be9745e357a4::t_41571546deb640 145-147,151-157,178-184,194
+include/mazu/proc.h
+  s_27be9745e357a4::t_496e5c46ac8904 144-149
+  s_27be9745e357a4::t_e39a92230b3501 150
+  s_27be9745e357a4::t_e7d7b7a5cfabd4 328
+include/mazu/errordef.h
+  s_27be9745e357a4::t_1071aa7dab3570 200-201
+kernel/proc/proc.c
+  s_27be9745e357a4::t_9dc18dc1f2d3d4 739,744-749
+  s_27be9745e357a4::t_a59c018865388e 841-848
+  s_27be9745e357a4::t_6f1759ec30548b 750
+  s_27be9745e357a4::t_c1d4ee826803f5 806-807
+docs/pse51-matrix.md
+  s_27be9745e357a4::t_3e46bde7355fb8 150
+  s_27be9745e357a4::t_a3d453e8ed1da2 254-256
+  s_27be9745e357a4::t_b914efddd02b68 277-285
+include/mazu/sysconf.h
+  s_27be9745e357a4::t_3cad6e52eac9dc 74-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "43eab9383436ad5776f4481a9d5d49737d944930",
+  "prompts": {},
+  "sessions": {
+    "s_27be9745e357a4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e43f194f-cef6-434c-ac7d-50ad22d1332e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
