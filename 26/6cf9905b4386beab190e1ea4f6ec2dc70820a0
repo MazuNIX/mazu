@@ -1,0 +1,9 @@
+scripts/pre-commit.hook
+  ai_agent 88-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "266cf9905b4386beab190e1ea4f6ec2dc70820a0",
+  "prompts": {}
+}
