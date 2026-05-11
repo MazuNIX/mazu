@@ -1,0 +1,29 @@
+rootfs/web/files.html
+  ai_agent 28
+rootfs/web/js/shell.js
+  ai_agent 1-309
+rootfs/web/js/dashboard.js
+  ai_agent 1-29
+rootfs/web/network.html
+  ai_agent 53
+rootfs/web/shell.html
+  ai_agent 29
+rootfs/web/telemetry.html
+  ai_agent 93
+rootfs/web/dashboard.html
+  ai_agent 62
+rootfs/web/js/network.js
+  ai_agent 1-71
+rootfs/web/js/files.js
+  ai_agent 1-81
+rootfs/web/js/telemetry.js
+  ai_agent 1-93
+rootfs/web/js/common.js
+  ai_agent 29-36,39-44,47-65,67-75,79-133,135-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "cacae585396643c31c2c93fd643e77505949b641",
+  "prompts": {}
+}
