@@ -1,0 +1,47 @@
+rootfs/web/files.html
+  s_27be9745e357a4::t_bde7c53d826aff 28
+rootfs/web/network.html
+  s_27be9745e357a4::t_b542476f979092 53
+rootfs/web/js/shell.js
+  s_27be9745e357a4::t_84c286eefccfc5 1-298
+rootfs/web/shell.html
+  s_27be9745e357a4::t_faa220a8d68ffb 29
+rootfs/web/js/dashboard.js
+  s_27be9745e357a4::t_86845a50e54d09 3-29
+  s_27be9745e357a4::t_d2be145e2f904f 1-2
+rootfs/web/telemetry.html
+  s_27be9745e357a4::t_2f1d0a3f21e2a8 93
+rootfs/web/js/network.js
+  s_27be9745e357a4::t_c18f2495041766 1-47
+  s_27be9745e357a4::t_ccc39d658831e6 48-71
+rootfs/web/dashboard.html
+  s_27be9745e357a4::t_1e1860035b9f07 62
+rootfs/web/js/telemetry.js
+  s_27be9745e357a4::t_2a21bce6832efc 1-12,30-31,35-38
+  s_27be9745e357a4::t_fb9d6b0fc8f819 39-69,71-93
+  s_27be9745e357a4::t_427aa9768537fe 13-29,32-34
+  s_27be9745e357a4::t_d41c524c9aaff4 70
+rootfs/web/js/files.js
+  s_27be9745e357a4::t_c8bdcc198d0495 1-27,51-57,59-81
+  s_27be9745e357a4::t_b835204fde0541 28-50,58
+rootfs/web/js/common.js
+  s_27be9745e357a4::t_a2104cca754e5d 144-145,154-159,171-172,174
+  s_27be9745e357a4::t_03228a153c9aef 103-130,132-143,146-153,160-170,173
+  s_27be9745e357a4::t_5018c39ec17417 29-36,39-44,47-65,67-75,79-100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "1c6d00e1f1dc76725f24dde8b453641e721faad5",
+  "prompts": {},
+  "sessions": {
+    "s_27be9745e357a4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e43f194f-cef6-434c-ac7d-50ad22d1332e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
