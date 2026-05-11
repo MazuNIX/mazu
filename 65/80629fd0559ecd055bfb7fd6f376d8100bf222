@@ -1,0 +1,9 @@
+.editorconfig
+  ai_agent 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6580629fd0559ecd055bfb7fd6f376d8100bf222",
+  "prompts": {}
+}
