@@ -1,0 +1,13 @@
+scripts/check.sh
+  ai_agent 704-762,1262,1267-1271,1276-1287
+user/net/web.c
+  ai_agent 36,40-47,51-52,1848-1852,1854-1857,1859-1862,1865-1868,1870-1873,1876-1879,1901-1902,1939,2396-2397,2399-2406,2418-2431,2805-2809
+kernel/net/tcp.c
+  ai_agent 49-51,53,57-61,63,978-987
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "48ebcca402fc4ce17b40f9cb5a31437717f3c275",
+  "prompts": {}
+}
