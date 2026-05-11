@@ -1,0 +1,19 @@
+scripts/check.sh
+  s_b1a6c1de66b94b::t_6bd68e3a03725f 1044
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "66ebd1bf1bdc98b16034ea40bfb839027fa1f794",
+  "prompts": {},
+  "sessions": {
+    "s_b1a6c1de66b94b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59d7df78-b1a3-470a-a5f6-c2c73b48b5ab",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
