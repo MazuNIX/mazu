@@ -5,9 +5,11 @@
  * Backward compatible: file_actions_ptr == 0 && attr_ptr == 0 behaves as the
  * original sys_spawn(path, pathlen).
  *
- * File actions are executed sequentially in the child's FD table before the
- * child is enqueued.  The child is not visible to sys_waitpid or sys_kill
- * until file actions complete and the task is enqueued.
+ * The child starts with a spawn-style clone of the parent's inheritable FD
+ * table. File actions are then executed sequentially in that child-local
+ * table before the child is enqueued. The child is not visible to
+ * sys_waitpid or sys_kill until file actions complete and the task is
+ * enqueued.
  *
  * Inspired by Spork (posix_spawn emulation for fork-free systems).
  */
@@ -55,7 +57,7 @@ struct spawn_attr {
 
 struct proc;
 
-/* Apply file actions to a child process's FD table.
+/* Apply file actions to a child process's capability-backed FD table.
  * Called after binary loading, before the child is enqueued.
  * Returns 0 on success, negative errno on failure.
  */

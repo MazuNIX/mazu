@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: MIT */
+#include <kernel/ipc/mqueue.h>
+#include <kernel/sync/sync_handle.h>
+#include <mazu/cap.h>
 #include <mazu/selftest.h>
 #include <mazu/syscall.h>
 #include <mazu/uaccess.h>
+#include <mazu/vfs.h>
 #include "../kernel/sync/futex.h"
 
 static struct proc *alloc_running_proc(void)
@@ -20,12 +24,36 @@ static struct sched_task *alloc_mock_task(void)
         return NULL;
     struct sched_task *td = byte_array_ptr(option_byte_array_checked(td_mem));
     memset(td, 0, sizeof(*td));
+    td->td_cap_slot = -1;
     return td;
 }
 
 static void free_mock_task(struct sched_task *td)
 {
     kvalloc_free(byte_array_new((byte *) td, sizeof(*td)));
+}
+
+static bool syscall_test_vfs_available(void)
+{
+    struct result_vfs_file f = vfs_open(STR("/hello.txt"));
+    if (f.is_error)
+        return false;
+    struct vfs_file vf = result_vfs_file_checked(f);
+    vfs_close(&vf);
+    return true;
+}
+
+static inline i32 syscall_test_thread_cap_slot(u8 task_slot)
+{
+    return CAP_SPACE_SLOTS - PROC_THREAD_MAX + (i32) task_slot;
+}
+
+static i64 syscall_test_thread_token(struct proc *p, struct sched_task *td)
+{
+    assert(p);
+    assert(td);
+    assert(td->td_cap_slot >= 0);
+    return cap_get_token(p, td->td_cap_slot, CAP_TYPE_THREAD);
 }
 
 /* Allocate a RUNNING proc + mock task, linked together. */
@@ -52,6 +80,20 @@ static bool alloc_proc_and_task(struct proc **out_p, struct sched_task **out_td)
             return false;
         }
     }
+    u8 thread_slot = proc_task_slot(p, td);
+    i32 thread_handle = cap_open_handle(
+        p, thread_slot, CAP_TYPE_THREAD, CAP_RIGHT_READ | CAP_RIGHT_WRITE,
+        syscall_test_thread_cap_slot(thread_slot), true);
+    if (thread_handle < 0) {
+        u64 pflags = proc_table_lock_irqsave();
+        (void) proc_reap_exited_thread_locked(p, td);
+        proc_table_unlock_irqrestore(pflags);
+        free_mock_task(td);
+        proc_set_state(p, PROC_STATE_ZOMBIE);
+        proc_free(p);
+        return false;
+    }
+    td->td_cap_slot = (i16) thread_handle;
     *out_p = p;
     *out_td = td;
     return true;
@@ -76,23 +118,19 @@ static bool attach_mock_thread(struct proc *p, struct sched_task *target)
     flags = proc_table_lock_irqsave();
     ok = proc_attach_task_slot(p, target, slot);
     proc_table_unlock_irqrestore(flags);
-    return ok;
-}
-
-static bool proc_has_thread_tid(struct proc *p, u16 tid)
-{
-    bool found = false;
-
-    u64 flags = proc_table_lock_irqsave();
-    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
-        struct sched_task *task = p->tasks[i];
-        if (task && task->id == tid) {
-            found = true;
-            break;
-        }
+    if (!ok)
+        return false;
+    i32 thread_handle = cap_open_handle(
+        p, slot, CAP_TYPE_THREAD, CAP_RIGHT_READ | CAP_RIGHT_WRITE,
+        syscall_test_thread_cap_slot(slot), true);
+    if (thread_handle < 0) {
+        flags = proc_table_lock_irqsave();
+        (void) proc_reap_exited_thread_locked(p, target);
+        proc_table_unlock_irqrestore(flags);
+        return false;
     }
-    proc_table_unlock_irqrestore(flags);
-    return found;
+    target->td_cap_slot = (i16) thread_handle;
+    return ok;
 }
 
 static i32 selftest_sys_open_emfile(void)
@@ -102,20 +140,105 @@ static i32 selftest_sys_open_emfile(void)
     assert(alloc_proc_and_task(&p, &td));
 
     /* Fill all FD slots so sys_open returns EMFILE. */
-    for (sz i = PROC_FD_STDERR + 1; i < PROC_FD_MAX; i++)
-        p->fd_table[i].is_open = true;
+    for (sz i = PROC_FD_STDERR + 1; i < CAP_SPACE_SLOTS - PROC_THREAD_MAX; i++)
+        assert(cap_dup_fd(p, PROC_FD_STDOUT, (i32) i, true) == (i32) i);
 
     struct trap_frame tf = {0};
     tf.a0 = USER_CODE_BASE;
     tf.a1 = 4;
     assert(sys_open(&tf, td) == -(i64) EMFILE);
 
-    for (sz i = PROC_FD_STDERR + 1; i < PROC_FD_MAX; i++)
-        p->fd_table[i].is_open = false;
     free_proc_and_task(p, td);
     return 0;
 }
 DEFINE_SELFTEST(sys_open_emfile, selftest_sys_open_emfile);
+
+static i32 selftest_sys_open_mints_non_grant_fd(void)
+{
+    if (!syscall_test_vfs_available())
+        return 0;
+
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const char path[] = "/hello.txt";
+    const vaddr_t va = USER_DATA_BASE + (137UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+    assert(copy_to_user(va, path, sizeof(path)) == 0);
+
+    struct trap_frame tf = {0};
+    tf.a0 = va;
+    tf.a1 = sizeof(path) - 1;
+    i64 fd = sys_open(&tf, td);
+    assert(fd >= 0);
+    assert(!cap_fd_has_rights(p, (i32) fd, CAP_RIGHT_GRANT));
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_open_mints_non_grant_fd,
+                selftest_sys_open_mints_non_grant_fd);
+
+static i32 selftest_sys_mq_open_emfile_rollback(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    for (i32 fd = PROC_FD_STDERR + 1; fd < CAP_SPACE_SLOTS - PROC_THREAD_MAX;
+         fd++)
+        assert(cap_dup_fd(p, PROC_FD_STDOUT, fd, true) == fd);
+
+    struct trap_frame tf = {0};
+    tf.a0 = 4;
+    tf.a1 = 8;
+    assert(sys_mq_open(&tf, td) == -(i64) EMFILE);
+
+    i32 handles[MQ_MAX_QUEUES];
+    for (i32 i = 0; i < MQ_MAX_QUEUES; i++) {
+        handles[i] = mqueue_open(NULL, 4, 8);
+        assert(handles[i] >= 0);
+    }
+    assert(mqueue_open(NULL, 4, 8) == -(i32) EAGAIN);
+    for (i32 i = 0; i < MQ_MAX_QUEUES; i++)
+        assert(mqueue_close(handles[i]) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_mq_open_emfile_rollback,
+                selftest_sys_mq_open_emfile_rollback);
+
+static i32 selftest_sys_mutex_init_emfile_rollback(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    for (i32 fd = PROC_FD_STDERR + 1; fd < CAP_SPACE_SLOTS - PROC_THREAD_MAX;
+         fd++)
+        assert(cap_dup_fd(p, PROC_FD_STDOUT, fd, true) == fd);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_MUTEX_INIT;
+    assert(syscall_dispatch(&tf, td) == -(i64) EMFILE);
+
+    i32 handles[SYNC_MAX_MUTEXES];
+    for (i32 i = 0; i < SYNC_MAX_MUTEXES; i++) {
+        handles[i] = sync_mutex_alloc(NULL);
+        assert(handles[i] >= 0);
+    }
+    assert(sync_mutex_alloc(NULL) == -(i32) EAGAIN);
+    for (i32 i = 0; i < SYNC_MAX_MUTEXES; i++)
+        sync_mutex_put_idx(handles[i]);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_mutex_init_emfile_rollback,
+                selftest_sys_mutex_init_emfile_rollback);
 
 static i32 selftest_sys_exit_frees_proc_slot(void)
 {
@@ -149,7 +272,7 @@ DEFINE_SELFTEST(syscall_enosys, selftest_syscall_enosys);
 static i32 selftest_syscall_needs_proc(void)
 {
     struct sched_task *td = alloc_mock_task();
-    assert(td != NULL);
+    assert(td);
     td->proc = NULL; /* no process */
 
     struct trap_frame tf = {0};
@@ -164,7 +287,7 @@ DEFINE_SELFTEST(syscall_needs_proc, selftest_syscall_needs_proc);
 static i32 selftest_syscall_needs_proc_new_handlers(void)
 {
     struct sched_task *td = alloc_mock_task();
-    assert(td != NULL);
+    assert(td);
     td->proc = NULL;
 
     struct trap_frame tf = {0};
@@ -417,7 +540,7 @@ static i32 selftest_sys_dup(void)
     tf.a0 = PROC_FD_STDOUT;
     i64 newfd = syscall_dispatch(&tf, td);
     assert(newfd == 3);
-    assert(p->fd_table[3].is_open);
+    assert(cap_fd_is_valid(p, 3));
 
     /* Dup again; should get FD 4. */
     tf.a0 = PROC_FD_STDOUT;
@@ -458,13 +581,24 @@ static i32 selftest_sys_dup2(void)
     tf.a1 = 5;
     i64 rc = syscall_dispatch(&tf, td);
     assert(rc == 5);
-    assert(p->fd_table[5].is_open);
+    assert(cap_fd_is_valid(p, 5));
 
     /* dup2(stdout, stdout) is a no-op, returns stdout. */
     tf.a0 = PROC_FD_STDOUT;
     tf.a1 = PROC_FD_STDOUT;
     rc = syscall_dispatch(&tf, td);
     assert(rc == PROC_FD_STDOUT);
+
+    /* dup2 to a reserved CAP_TYPE_THREAD slot must fail without
+     * destroying the live thread handle stored there.
+     */
+    i64 thread_token = syscall_test_thread_token(p, td);
+    assert(thread_token > 0);
+    tf.a0 = PROC_FD_STDOUT;
+    tf.a1 = td->td_cap_slot;
+    rc = syscall_dispatch(&tf, td);
+    assert(rc == -(i64) EBADF);
+    assert(syscall_test_thread_token(p, td) == thread_token);
 
     free_proc_and_task(p, td);
     return 0;
@@ -477,13 +611,17 @@ static i32 selftest_sys_lseek(void)
     struct sched_task *td;
     assert(alloc_proc_and_task(&p, &td));
 
-    /* Set up a fake seekable FD without opening a real file.
-     * sys_lseek only touches fd_table[fd].offset / is_seekable.
-     */
+    if (!syscall_test_vfs_available()) {
+        free_proc_and_task(p, td);
+        return 0;
+    }
+
     i32 fd = 3;
-    p->fd_table[fd].is_open = true;
-    p->fd_table[fd].is_seekable = true;
-    p->fd_table[fd].offset = 0;
+    struct result_vfs_file fres = vfs_open(STR("/hello.txt"));
+    assert(!fres.is_error);
+    assert(cap_open_vfs(p, result_vfs_file_checked(fres),
+                        CAP_RIGHT_READ | CAP_RIGHT_WRITE, true, fd,
+                        true) == fd);
 
     /* SEEK_SET to position 10. */
     struct trap_frame tf = {0};
@@ -492,7 +630,10 @@ static i32 selftest_sys_lseek(void)
     tf.a2 = SEEK_SET;
     i64 pos = sys_lseek(&tf, td);
     assert(pos == 10);
-    assert(p->fd_table[fd].offset == 10);
+    struct cap_ref ref = cap_lookup_fd(p, fd, 0);
+    assert(ref.ptr);
+    assert(((struct fd_pool_entry *) ref.ptr)->offset == 10);
+    cap_put_ref(&ref);
 
     /* SEEK_CUR +5 -> position 15. */
     tf.a1 = 5;
@@ -511,8 +652,6 @@ static i32 selftest_sys_lseek(void)
     tf.a2 = SEEK_SET;
     assert(sys_lseek(&tf, td) == -(i64) ESPIPE);
 
-    /* Cleanup. */
-    p->fd_table[fd].is_open = false;
     free_proc_and_task(p, td);
     return 0;
 }
@@ -783,7 +922,7 @@ static i32 selftest_fsync_fdatasync(void)
     /* Closed but in-range FD -> EBADF. */
     tf.a7 = SYS_FSYNC;
     tf.a0 = PROC_FD_STDERR + 1;
-    assert(!p->fd_table[PROC_FD_STDERR + 1].is_open);
+    assert(!cap_fd_is_valid(p, PROC_FD_STDERR + 1));
     assert(syscall_dispatch(&tf, td) == -(i64) EBADF);
 
     /* Open FD (stdout) -> success. */
@@ -794,13 +933,15 @@ static i32 selftest_fsync_fdatasync(void)
     assert(syscall_dispatch(&tf, td) == 0);
 
     /* Pipe FD -> EINVAL (POSIX: fsync on a non-syncable file type). */
-    p->fd_table[PROC_FD_STDIN].is_pipe = true;
+    struct pipe *pipe = pipe_alloc();
+    assert(pipe);
+    assert(cap_open_pipe(p, pipe, true, CAP_RIGHT_READ | CAP_RIGHT_GRANT,
+                         PROC_FD_STDIN, true) == PROC_FD_STDIN);
     tf.a7 = SYS_FSYNC;
     tf.a0 = PROC_FD_STDIN;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
     tf.a7 = SYS_FDATASYNC;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
-    p->fd_table[PROC_FD_STDIN].is_pipe = false;
 
     free_proc_and_task(p, td);
     return 0;
@@ -1033,9 +1174,9 @@ static i32 selftest_thread_schedparam(void)
     tf.a1 = CONFIG_SCHED_NPRIO + 5;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
 
-    /* Unknown TID -> ESRCH. */
+    /* Unknown thread handle -> ESRCH. */
     tf.a7 = SYS_THREAD_GETSCHEDPARAM;
-    tf.a0 = (u64) U16_MAX;
+    tf.a0 = (u64) -1;
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
 
     /* sched_setscheduler / sched_getscheduler return SCHED_FIFO for
@@ -1079,7 +1220,6 @@ static i32 selftest_thread_detach_states(void)
      */
     struct sched_task *target = alloc_mock_task();
     assert(target);
-    target->id = td->id + 1;
     target->td_join_state = TD_JOIN_JOINABLE;
     init_waitqueue_head(&target->td_join_wq);
     assert(attach_mock_thread(p, target));
@@ -1087,7 +1227,7 @@ static i32 selftest_thread_detach_states(void)
     /* Detach the JOINABLE target -> succeeds, state becomes DETACHED. */
     struct trap_frame tf = {0};
     tf.a7 = SYS_THREAD_DETACH;
-    tf.a0 = target->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, target);
     assert(syscall_dispatch(&tf, td) == 0);
     assert(target->td_join_state == TD_JOIN_DETACHED);
 
@@ -1096,16 +1236,16 @@ static i32 selftest_thread_detach_states(void)
 
     /* Join on a DETACHED thread -> EINVAL. */
     tf.a7 = SYS_THREAD_JOIN;
-    tf.a0 = target->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, target);
     tf.a1 = 0;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
 
     /* Self-join -> EDEADLK. */
-    tf.a0 = td->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, td);
     assert(syscall_dispatch(&tf, td) == -(i64) EDEADLK);
 
-    /* Unknown TID -> ESRCH. */
-    tf.a0 = (u64) U16_MAX - 1;
+    /* Unknown thread handle -> ESRCH. */
+    tf.a0 = (u64) -1;
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
 
     /* Cleanup: detach the target before freeing the proc. */
@@ -1127,7 +1267,6 @@ static i32 selftest_thread_join_efault_preserves_exited_target(void)
     struct sched_task *target = alloc_mock_task();
     assert(target);
     target->proc = p;
-    target->id = td->id + 1;
     target->td_join_state = TD_JOIN_EXITED;
     target->td_exit_code = 42;
     init_waitqueue_head(&target->td_join_wq);
@@ -1135,11 +1274,11 @@ static i32 selftest_thread_join_efault_preserves_exited_target(void)
 
     struct trap_frame tf = {0};
     tf.a7 = SYS_THREAD_JOIN;
-    tf.a0 = target->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, target);
     tf.a1 = USER_CODE_BASE - sizeof(i32);
     assert(syscall_dispatch(&tf, td) == -(i64) EFAULT);
     assert(target->td_join_state == TD_JOIN_EXITED);
-    assert(proc_has_thread_tid(p, target->id));
+    assert(cap_slot_read(p, target->td_cap_slot).valid);
 
     const vaddr_t va = USER_DATA_BASE + (136UL * PAGE_SIZE);
     assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
@@ -1149,13 +1288,60 @@ static i32 selftest_thread_join_efault_preserves_exited_target(void)
     i32 exit_code = 0;
     assert(copy_from_user(&exit_code, va, sizeof(exit_code)) == 0);
     assert(exit_code == 42);
-    assert(!proc_has_thread_tid(p, target->id));
+    assert(!cap_slot_read(p, target->td_cap_slot).valid);
 
     free_proc_and_task(p, td);
     return 0;
 }
 DEFINE_SELFTEST(thread_join_efault_preserves_exited_target,
                 selftest_thread_join_efault_preserves_exited_target);
+
+static i32 selftest_thread_handle_stale_rejected_after_reuse(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct sched_task *old_target = alloc_mock_task();
+    assert(old_target);
+    old_target->proc = p;
+    old_target->td_join_state = TD_JOIN_JOINABLE;
+    init_waitqueue_head(&old_target->td_join_wq);
+    assert(attach_mock_thread(p, old_target));
+    u64 stale_token = (u64) syscall_test_thread_token(p, old_target);
+
+    u64 flags = proc_table_lock_irqsave();
+    proc_detach_task(p, old_target);
+    proc_table_unlock_irqrestore(flags);
+    free_mock_task(old_target);
+
+    struct sched_task *new_target = alloc_mock_task();
+    assert(new_target);
+    new_target->proc = p;
+    new_target->td_join_state = TD_JOIN_JOINABLE;
+    init_waitqueue_head(&new_target->td_join_wq);
+    assert(attach_mock_thread(p, new_target));
+    u64 fresh_token = (u64) syscall_test_thread_token(p, new_target);
+    assert(fresh_token != stale_token);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_PTHREAD_KILL;
+    tf.a0 = stale_token;
+    tf.a1 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
+
+    tf.a0 = fresh_token;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    flags = proc_table_lock_irqsave();
+    proc_detach_task(p, new_target);
+    proc_table_unlock_irqrestore(flags);
+    free_mock_task(new_target);
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(thread_handle_stale_rejected_after_reuse,
+                selftest_thread_handle_stale_rejected_after_reuse);
 
 /* Verify clock_gettime on the per-thread and per-process CPU-time
  * clocks returns a valid timespec.  Mock task cpu_time_us is zero by
@@ -1210,7 +1396,7 @@ static i32 selftest_pthread_kill(void)
 
     /* Self-target: signo lands on td->td_sig.pending. */
     tf.a7 = SYS_PTHREAD_KILL;
-    tf.a0 = td->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, td);
     tf.a1 = SIGUSR1;
     assert(syscall_dispatch(&tf, td) == 0);
     assert((td->td_sig.pending & sig_bit(SIGUSR1)) != 0);
@@ -1226,8 +1412,8 @@ static i32 selftest_pthread_kill(void)
     tf.a1 = SIGKILL;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
 
-    /* Unknown TID -> ESRCH. */
-    tf.a0 = (u64) U16_MAX - 5;
+    /* Unknown thread handle -> ESRCH. */
+    tf.a0 = (u64) -1;
     tf.a1 = SIGUSR1;
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
 
@@ -1245,14 +1431,13 @@ static i32 selftest_pthread_kill_exited_thread_esrch(void)
     struct sched_task *target = alloc_mock_task();
     assert(target);
     target->proc = p;
-    target->id = td->id + 1;
     target->td_join_state = TD_JOIN_EXITED;
     init_waitqueue_head(&target->td_join_wq);
     assert(attach_mock_thread(p, target));
 
     struct trap_frame tf = {0};
     tf.a7 = SYS_PTHREAD_KILL;
-    tf.a0 = target->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, target);
     tf.a1 = SIGUSR1;
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
     assert(target->td_sig.pending == 0);
@@ -1300,13 +1485,13 @@ static i32 selftest_thread_cancel_state(void)
     tf.a0 = 99;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
 
-    /* SYS_THREAD_CANCEL on unknown TID -> ESRCH. */
+    /* SYS_THREAD_CANCEL on unknown thread handle -> ESRCH. */
     tf.a7 = SYS_THREAD_CANCEL;
-    tf.a0 = (u64) U16_MAX - 7;
+    tf.a0 = (u64) -1;
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
 
-    /* SYS_THREAD_CANCEL on self-tid sets td_cancel_pending. */
-    tf.a0 = td->id;
+    /* SYS_THREAD_CANCEL on self handle sets td_cancel_pending. */
+    tf.a0 = (u64) syscall_test_thread_token(p, td);
     assert(syscall_dispatch(&tf, td) == 0);
     assert(td->td_cancel_pending == true);
 
@@ -1331,14 +1516,13 @@ static i32 selftest_thread_cancel_exited_thread_esrch(void)
     struct sched_task *target = alloc_mock_task();
     assert(target);
     target->proc = p;
-    target->id = td->id + 1;
     target->td_join_state = TD_JOIN_EXITED;
     init_waitqueue_head(&target->td_join_wq);
     assert(attach_mock_thread(p, target));
 
     struct trap_frame tf = {0};
     tf.a7 = SYS_THREAD_CANCEL;
-    tf.a0 = target->id;
+    tf.a0 = (u64) syscall_test_thread_token(p, target);
     assert(syscall_dispatch(&tf, td) == -(i64) ESRCH);
     assert(target->td_cancel_pending == false);
 

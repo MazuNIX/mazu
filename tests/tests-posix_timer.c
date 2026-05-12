@@ -33,17 +33,22 @@ static i32 test_posix_timer_owner_isolation(void)
 {
     struct proc *owner = proc_alloc();
     struct proc *other = proc_alloc();
-    SELFTEST_ASSERT(owner != NULL, 1);
-    SELFTEST_ASSERT(other != NULL, 2);
+    SELFTEST_ASSERT(owner, 1);
+    SELFTEST_ASSERT(other, 2);
 
-    i32 h = posix_timer_create(owner);
+    i32 object_index = posix_timer_alloc(owner);
+    SELFTEST_ASSERT(object_index >= 0, 3);
+    i32 h = cap_open_timer(owner, (u16) object_index,
+                           CAP_RIGHT_READ | CAP_RIGHT_WRITE, 3, true);
     SELFTEST_ASSERT(h >= 0, 3);
 
-    SELFTEST_ASSERT(posix_timer_settime(h, other, 10, 0, 0) == -(i32) EPERM, 4);
-    SELFTEST_ASSERT(posix_timer_gettime(h, other) == -(i64) EPERM, 5);
-    SELFTEST_ASSERT(posix_timer_getoverrun(h, other) == -(i64) EPERM, 6);
-    SELFTEST_ASSERT(posix_timer_delete(h, other) == -(i32) EPERM, 7);
-    SELFTEST_ASSERT(posix_timer_delete(h, owner) == 0, 8);
+    SELFTEST_ASSERT(cap_lookup_timer(other, h, CAP_RIGHT_WRITE).ptr == NULL, 4);
+    SELFTEST_ASSERT(cap_lookup_timer(other, h, CAP_RIGHT_READ).ptr == NULL, 5);
+
+    struct cap_slot_view slot = cap_slot_read(owner, h);
+    SELFTEST_ASSERT(slot.valid, 6);
+    SELFTEST_ASSERT(slot.type == CAP_TYPE_TIMER, 7);
+    SELFTEST_ASSERT(cap_drop_token(owner, cap_make_handle(&slot)) == 0, 8);
 
     proc_free(owner);
     proc_free(other);
@@ -54,26 +59,31 @@ DEFINE_SELFTEST(posix_timer_owner_isolation, test_posix_timer_owner_isolation);
 static i32 test_posix_timer_teardown_on_proc_exit(void)
 {
     struct proc *owner = proc_alloc();
-    SELFTEST_ASSERT(owner != NULL, 1);
+    SELFTEST_ASSERT(owner, 1);
     proc_set_state(owner, PROC_STATE_RUNNING);
 
-    i32 h = posix_timer_create(owner);
-    SELFTEST_ASSERT(h >= 0, 2);
-    SELFTEST_ASSERT(posix_timer_settime(h, owner, 50, 0, 0) == 0, 3);
-    SELFTEST_ASSERT(timer_pool[h].in_use, 4);
-    SELFTEST_ASSERT(timer_pool[h].owner == owner, 5);
+    i32 object_index = posix_timer_alloc(owner);
+    SELFTEST_ASSERT(object_index >= 0, 2);
+    i32 h = cap_open_timer(owner, (u16) object_index,
+                           CAP_RIGHT_READ | CAP_RIGHT_WRITE, 3, true);
+    SELFTEST_ASSERT(h >= 0, 3);
+    SELFTEST_ASSERT(posix_timer_settime_idx((u16) object_index, 50, 0, 0) == 0,
+                    4);
+    SELFTEST_ASSERT(timer_pool[object_index].in_use, 5);
+    SELFTEST_ASSERT(timer_pool[object_index].owner == owner, 6);
 
     proc_exit(owner, 0);
 
-    SELFTEST_ASSERT(!timer_pool[h].in_use, 6);
-    SELFTEST_ASSERT(!timer_pool[h].armed, 7);
-    SELFTEST_ASSERT(timer_pool[h].owner == NULL, 8);
-    SELFTEST_ASSERT(timer_pool[h].owner_generation == 0, 9);
+    SELFTEST_ASSERT(!timer_pool[object_index].in_use, 7);
+    SELFTEST_ASSERT(!timer_pool[object_index].armed, 8);
+    SELFTEST_ASSERT(!timer_pool[object_index].owner, 9);
+    SELFTEST_ASSERT(timer_pool[object_index].owner_generation == 0, 10);
 
     struct proc *reused = proc_alloc();
-    SELFTEST_ASSERT(reused != NULL, 10);
-    SELFTEST_ASSERT(posix_timer_settime(h, reused, 10, 0, 0) == -(i32) EINVAL,
-                    11);
+    SELFTEST_ASSERT(reused, 11);
+    SELFTEST_ASSERT(
+        posix_timer_settime_idx((u16) object_index, 10, 0, 0) == -(i32) EINVAL,
+        12);
     proc_free(reused);
     return 0;
 }
@@ -83,9 +93,9 @@ DEFINE_SELFTEST(posix_timer_teardown_on_proc_exit,
 static i32 test_posix_timer_stale_owner_generation(void)
 {
     struct proc *owner = proc_alloc();
-    SELFTEST_ASSERT(owner != NULL, 1);
+    SELFTEST_ASSERT(owner, 1);
 
-    i32 h = posix_timer_create(owner);
+    i32 h = posix_timer_alloc(owner);
     SELFTEST_ASSERT(h >= 0, 2);
 
     struct posix_timer *t = &timer_pool[h];
@@ -95,7 +105,7 @@ static i32 test_posix_timer_stale_owner_generation(void)
     proc_free(owner);
 
     struct proc *reused = proc_alloc();
-    SELFTEST_ASSERT(reused != NULL, 4);
+    SELFTEST_ASSERT(reused, 4);
     SELFTEST_ASSERT(reused == owner, 5);
     proc_set_state(reused, PROC_STATE_RUNNING);
     /* No task is attached to the reused proc here, so the per-thread
@@ -125,22 +135,23 @@ DEFINE_SELFTEST(posix_timer_stale_owner_generation,
 static i32 test_posix_timer_rejects_exited_thread_target(void)
 {
     struct proc *owner = proc_alloc();
-    SELFTEST_ASSERT(owner != NULL, 1);
+    SELFTEST_ASSERT(owner, 1);
     proc_set_state(owner, PROC_STATE_RUNNING);
 
     struct sched_task *target = alloc_mock_task();
-    SELFTEST_ASSERT(target != NULL, 2);
+    SELFTEST_ASSERT(target, 2);
     target->proc = owner;
     target->id = 7;
     target->td_join_state = TD_JOIN_EXITED;
     SELFTEST_ASSERT(attach_mock_task(owner, target), 3);
 
-    i32 h = posix_timer_create(owner);
+    i32 h = posix_timer_alloc(owner);
     SELFTEST_ASSERT(h >= 0, 4);
     SELFTEST_ASSERT(
-        posix_timer_settime(h, owner, 10, 0, target->id) == -(i32) ESRCH, 5);
+        posix_timer_settime_idx((u16) h, 10, 0, target->id) == -(i32) ESRCH, 5);
     SELFTEST_ASSERT(timer_pool[h].target_tid == 0, 6);
-    SELFTEST_ASSERT(posix_timer_delete(h, owner) == 0, 7);
+    posix_timer_put_idx((u16) h);
+    SELFTEST_ASSERT(!timer_pool[h].in_use, 7);
 
     u64 flags = proc_table_lock_irqsave();
     proc_detach_task(owner, target);

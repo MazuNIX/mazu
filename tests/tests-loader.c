@@ -8,7 +8,7 @@ static i32 selftest_elf_load(void)
     u8 garbage[64] = {0};
     struct byte_view bv = byte_view_new(garbage, sizeof(garbage));
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     struct result r = proc_load_elf(p, bv);
     assert(r.is_error); /* should fail: bad magic */
     proc_free(p);

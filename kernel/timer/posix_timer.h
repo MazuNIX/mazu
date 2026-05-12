@@ -23,6 +23,7 @@ struct posix_timer {
     u32 overrun;
     bool armed;
     bool in_use;
+    u32 refcount;
     /* SIGEV_THREAD_ID target TID. 0 selects process-directed delivery
      * (the kernel's signal_send picks an eligible thread). Non-zero
      * directs SIGALRM at the matching thread of the owning proc; if
@@ -32,31 +33,32 @@ struct posix_timer {
     u16 target_tid;
 };
 
-/* Allocate a timer for the given process.  Returns handle >= 0 or -EAGAIN. */
-i32 posix_timer_create(struct proc *p);
+/* Allocate a timer object for the given process. Returns pool index >= 0. */
+i32 posix_timer_alloc(struct proc *p);
 
-/* Arm a timer.  Caller must be the owner.
+/* Arm a timer by pool index.
  * value_ms = initial expiry (0 = disarm), interval_ms = repeat (0 = one-shot).
  * target_tid = SIGEV_THREAD_ID target (0 = process-directed).
  */
-i32 posix_timer_settime(i32 handle,
-                        struct proc *caller,
-                        u64 value_ms,
-                        u64 interval_ms,
-                        u16 target_tid);
+i32 posix_timer_settime_idx(u16 object_index,
+                            u64 value_ms,
+                            u64 interval_ms,
+                            u16 target_tid);
 
-/* Disarm and delete a timer.  Caller must be the owner. */
-i32 posix_timer_delete(i32 handle, struct proc *caller);
+/* Drop a timer object reference. Refcount 0 tears the timer down. */
+void posix_timer_put_idx(u16 object_index);
 
-/* Get remaining time in ms.  Caller must be the owner.
- * Returns ms >= 0 or -EINVAL/-EPERM.
+/* Get remaining time in ms by pool index.
+ * Returns ms >= 0 or -EINVAL.
  */
-i64 posix_timer_gettime(i32 handle, struct proc *caller);
+i64 posix_timer_gettime_idx(u16 object_index);
 
-/* Get overrun count.  Caller must be the owner.
- * Returns count >= 0 or -EINVAL/-EPERM.
+/* Get overrun count by pool index.
+ * Returns count >= 0 or -EINVAL.
  */
-i64 posix_timer_getoverrun(i32 handle, struct proc *caller);
+i64 posix_timer_getoverrun_idx(u16 object_index);
+
+struct posix_timer *posix_timer_ptr(u16 object_index);
 
 /* Delete all timers owned by a process.  Called during process teardown. */
 void posix_timer_teardown_proc(struct proc *p);

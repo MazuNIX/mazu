@@ -96,6 +96,7 @@ i32 mqueue_open(struct proc *owner, u32 max_msgs, sz max_msg_size)
             mq_pool[i].generation = next_generation;
             mq_pool[i].max_msgs = max_msgs;
             mq_pool[i].max_msg_size = max_msg_size;
+            mq_pool[i].refcount = 1;
             spin_unlock_irqrestore(&mq_global_lock, flags);
             return i;
         }
@@ -104,25 +105,18 @@ i32 mqueue_open(struct proc *owner, u32 max_msgs, sz max_msg_size)
     return -(i32) EAGAIN;
 }
 
-i32 mqueue_close(i32 handle)
+/* Tear down the queue's wait state and mark it free. Caller must hold
+ * mq_global_lock for the in_use transition; this helper acquires the
+ * per-queue lock to drain waiters.
+ */
+static void mqueue_destroy_locked(i32 handle)
 {
-    if (handle < 0 || handle >= MQ_MAX_QUEUES)
-        return -(i32) EBADF;
-
     struct mqueue *mq = &mq_pool[handle];
-    u64 gflags = spin_lock_irqsave(&mq_global_lock);
-    if (!mq->in_use) {
-        spin_unlock_irqrestore(&mq_global_lock, gflags);
-        return -(i32) EBADF;
-    }
 
-    /* Wake all blocked senders and receivers before closing.
-     * Waiters will recheck mq state and see in_use == false or an empty
-     * queue, then return an error.
-     */
     lockdep_acquire(LOCK_LEVEL_WAITQ);
     u64 flags = spin_lock_irqsave(&mq->lock);
     mq->in_use = false;
+    mq->refcount = 0;
     mqueue_reset_storage_locked(handle);
 
     while (!list_empty(&mq->recv_waitq)) {
@@ -142,8 +136,59 @@ i32 mqueue_close(i32 handle)
 
     spin_unlock_irqrestore(&mq->lock, flags);
     lockdep_release(LOCK_LEVEL_WAITQ);
+}
+
+i32 mqueue_close(i32 handle)
+{
+    if (handle < 0 || handle >= MQ_MAX_QUEUES)
+        return -(i32) EBADF;
+
+    struct mqueue *mq = &mq_pool[handle];
+    u64 gflags = spin_lock_irqsave(&mq_global_lock);
+    if (!mq->in_use) {
+        spin_unlock_irqrestore(&mq_global_lock, gflags);
+        return -(i32) EBADF;
+    }
+
+    mqueue_destroy_locked(handle);
     spin_unlock_irqrestore(&mq_global_lock, gflags);
     return 0;
+}
+
+void mqueue_put_idx(i32 handle)
+{
+    if (handle < 0 || handle >= MQ_MAX_QUEUES)
+        return;
+
+    struct mqueue *mq = &mq_pool[handle];
+    u64 gflags = spin_lock_irqsave(&mq_global_lock);
+    if (!mq->in_use) {
+        spin_unlock_irqrestore(&mq_global_lock, gflags);
+        return;
+    }
+    if (mq->refcount > 1) {
+        mq->refcount--;
+        spin_unlock_irqrestore(&mq_global_lock, gflags);
+        return;
+    }
+    mqueue_destroy_locked(handle);
+    spin_unlock_irqrestore(&mq_global_lock, gflags);
+}
+
+bool mqueue_inc_idx(i32 handle)
+{
+    if (handle < 0 || handle >= MQ_MAX_QUEUES)
+        return false;
+
+    struct mqueue *mq = &mq_pool[handle];
+    u64 gflags = spin_lock_irqsave(&mq_global_lock);
+    if (!mq->in_use) {
+        spin_unlock_irqrestore(&mq_global_lock, gflags);
+        return false;
+    }
+    mq->refcount++;
+    spin_unlock_irqrestore(&mq_global_lock, gflags);
+    return true;
 }
 
 static struct mqueue *mqueue_get(i32 handle)

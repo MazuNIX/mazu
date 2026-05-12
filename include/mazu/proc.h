@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /* User-space process management.
  *
- * Each process owns a set of user-mapped pages, a file descriptor table,
- * and a bounded thread group. The process table is a small static array
- * (PROC_MAX entries).
+ * Each process owns a set of user-mapped pages, a fixed capability table
+ * (see struct cap_space) that backs POSIX file descriptors and other
+ * object handles, and a bounded thread group. The process table is a
+ * small static array (PROC_MAX entries).
  */
 
 #ifndef MAZU_PROC_H
@@ -11,6 +12,7 @@
 
 #include <mazu/base.h>
 #include <mazu/byte.h>
+#include <mazu/cap.h>
 #include <mazu/error.h>
 #include <mazu/paging.h>
 #include <mazu/spinlock.h>
@@ -40,7 +42,6 @@ struct signal_state {
 };
 
 #define PROC_MAX 16
-#define PROC_FD_MAX 32
 #define PROC_PAGES_MAX 32
 #define PROC_VMA_MAX 8
 
@@ -52,6 +53,7 @@ struct signal_state {
  * are bounded.
  */
 #define PROC_THREAD_MAX 4
+#define PROC_FD_MAX (CAP_SPACE_SLOTS - PROC_THREAD_MAX)
 #define PROC_FD_STDIN 0
 #define PROC_FD_STDOUT 1
 #define PROC_FD_STDERR 2
@@ -90,19 +92,6 @@ enum proc_state {
     PROC_STATE_ZOMBIE,   /* exited, awaiting parent reap */
 };
 
-struct pipe; /* forward declaration */
-
-struct proc_fd {
-    bool is_open;
-    bool is_dup;        /* true if created via dup/dup2; skip vfs_close */
-    bool is_seekable;   /* false for console/pipe; true for regular files */
-    bool is_pipe;       /* true if this FD is a pipe end */
-    bool pipe_read_end; /* true: read, false: write (only if is_pipe) */
-    sz offset;          /* current file position (used by read/write/lseek) */
-    struct vfs_file file;
-    struct pipe *pipe; /* non-NULL if is_pipe */
-};
-
 /* Per-process VA slot size: divide user address space equally among PROC_MAX
  * processes. Each slot contains code, data, and stack. Slot i occupies
  * [USER_CODE_BASE + i*PROC_SLOT_SIZE, USER_CODE_BASE + (i+1)*PROC_SLOT_SIZE).
@@ -135,7 +124,7 @@ struct proc {
         paddr_t paddr;
         vaddr_t vaddr;
     } user_pages[PROC_PAGES_MAX];
-    struct proc_fd fd_table[PROC_FD_MAX];
+    struct cap_space cap_space;
     u32 magic;
     u32 generation;
     u8 vma_cache_read;
@@ -164,6 +153,7 @@ struct proc {
 
     u16 pid;
     u16 parent_pid;
+    u32 parent_generation;
     char name[32];
     char cwd[PROC_PATH_MAX];
 };
@@ -229,7 +219,7 @@ bool proc_attach_task_slot(struct proc *p, struct sched_task *td, u8 slot);
 bool proc_reserve_thread_slot(struct proc *p, u8 *out_slot);
 void proc_release_thread_slot(struct proc *p, u8 slot);
 void proc_release_thread_stack(struct proc *p, u8 slot);
-void proc_reap_exited_thread_locked(struct proc *p, struct sched_task *td);
+i64 proc_reap_exited_thread_locked(struct proc *p, struct sched_task *td);
 void proc_reap_exited_thread(struct proc *p, struct sched_task *td);
 
 /* Detach the given task from the process. The task's ->proc field is cleared.
@@ -261,6 +251,21 @@ struct proc *proc_find(u16 pid);
 
 /* Look up a process by PID.  Caller must hold proc_table_lock. */
 struct proc *proc_find_locked(u16 pid);
+
+/* Snapshot the live descendant tree rooted at root/root_generation.
+ * Includes root itself when still live. Returns the number of entries
+ * written to out/out_generations (up to max).
+ */
+sz proc_collect_descendants_locked(struct proc *root,
+                                   u32 root_generation,
+                                   struct proc **out,
+                                   u32 *out_generations,
+                                   sz max);
+sz proc_collect_descendants(struct proc *root,
+                            u32 root_generation,
+                            struct proc **out,
+                            u32 *out_generations,
+                            sz max);
 
 /* Iterate all active processes, calling cb for each. */
 typedef void (*proc_iter_cb_t)(struct proc *p, void *ctx);

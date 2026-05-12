@@ -92,6 +92,7 @@ kernel_files-y += kernel/eventlog.c
 # User-space process support
 kernel_files-y += kernel/proc/uaccess.c kernel/proc/proc.c \
     kernel/proc/syscall.c kernel/proc/loader.c kernel/proc/spawn.c \
+    kernel/proc/cap.c \
     kernel/proc/pipe.c kernel/proc/signal.c
 
 # TCP/IP stack

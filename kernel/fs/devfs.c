@@ -175,7 +175,7 @@ static struct result_vfs_stat devfs_stat(void *ctx __unused, struct str path)
 
     struct vfs_stat st = vfs_rdonly_file_stat();
     if (dev_table[idx].write != NULL)
-        st.flags = 0;
+        st.flags &= ~(u8) VFS_FLAG_RDONLY;
     return result_vfs_stat_ok(st);
 }
 

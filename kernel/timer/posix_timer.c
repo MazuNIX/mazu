@@ -15,13 +15,6 @@
 static struct posix_timer timer_pool[POSIX_TIMER_MAX];
 static spinlock_t timer_lock = SPINLOCK_INITIALIZER;
 
-static inline bool posix_timer_owner_matches(const struct posix_timer *t,
-                                             const struct proc *p)
-{
-    return t->in_use && t->owner == p && p &&
-           t->owner_generation == p->generation;
-}
-
 static inline bool posix_timer_owner_alive(const struct posix_timer *t)
 {
     struct proc *owner = t->owner;
@@ -57,6 +50,64 @@ static bool posix_timer_target_is_live(const struct sched_task *td)
            td->state != TD_STATE_TERMINATING;
 }
 
+i32 posix_timer_alloc(struct proc *p)
+{
+    if (!p)
+        return -(i32) EINVAL;
+
+    u64 flags = spin_lock_irqsave(&timer_lock);
+    for (i32 i = 0; i < POSIX_TIMER_MAX; i++) {
+        if (!timer_pool[i].in_use) {
+            timer_pool[i].in_use = true;
+            timer_pool[i].owner = p;
+            timer_pool[i].owner_generation = p->generation;
+            timer_pool[i].armed = false;
+            timer_pool[i].overrun = 0;
+            timer_pool[i].interval_ticks = 0;
+            timer_pool[i].target_tid = 0;
+            timer_pool[i].refcount = 1;
+            callout_init(&timer_pool[i].co);
+            spin_unlock_irqrestore(&timer_lock, flags);
+            return i;
+        }
+    }
+    spin_unlock_irqrestore(&timer_lock, flags);
+    return -(i32) EAGAIN;
+}
+
+struct posix_timer *posix_timer_ptr(u16 object_index)
+{
+    if (object_index >= POSIX_TIMER_MAX)
+        return NULL;
+    return &timer_pool[object_index];
+}
+
+static void posix_timer_free(struct posix_timer *t)
+{
+    t->armed = false;
+    callout_cancel_sync(&t->co);
+
+    u64 flags = spin_lock_irqsave(&timer_lock);
+    t->in_use = false;
+    t->owner = NULL;
+    t->owner_generation = 0;
+    t->interval_ticks = 0;
+    t->overrun = 0;
+    t->target_tid = 0;
+    t->refcount = 0;
+    spin_unlock_irqrestore(&timer_lock, flags);
+}
+
+void posix_timer_put_idx(u16 object_index)
+{
+    struct posix_timer *t = posix_timer_ptr(object_index);
+    if (!t || !t->in_use)
+        return;
+    u32 rc = __atomic_sub_fetch(&t->refcount, 1, __ATOMIC_ACQ_REL);
+    if (rc == 0)
+        posix_timer_free(t);
+}
+
 static void timer_expiry_fn(void *arg)
 {
     struct posix_timer *t = arg;
@@ -71,11 +122,6 @@ static void timer_expiry_fn(void *arg)
         t->armed = false;
         return;
     }
-    /* SIGEV_THREAD_ID: deliver to the specified thread directly. If
-     * the target thread has exited since posix_timer_settime, the
-     * signal is silently dropped: a thread-directed signal must not
-     * spray onto sibling threads that did not opt in.
-     */
     if (t->target_tid != 0) {
         u64 tflags = proc_table_lock_irqsave();
         struct sched_task *target = NULL;
@@ -101,72 +147,34 @@ static void timer_expiry_fn(void *arg)
     }
 
     if (t->interval_ticks > 0) {
-        /* Periodic: re-arm only if still armed.  posix_timer_delete
-         * clears armed before callout_cancel_sync, so re-checking here
-         * prevents re-arming a deleted timer.
-         */
         if (!t->armed)
             return;
-        /* POSIX overrun: count expirations that occur while the previous
-         * SIGALRM is still pending (not yet delivered/handled) on any
-         * thread in the group.
-         */
-        {
-            u64 tflags = proc_table_lock_irqsave();
-            bool alrm_pending =
-                posix_timer_signal_pending_locked(owner, SIGALRM);
-            proc_table_unlock_irqrestore(tflags);
-            if (alrm_pending)
-                t->overrun++;
-        }
+        u64 tflags = proc_table_lock_irqsave();
+        bool alrm_pending = posix_timer_signal_pending_locked(owner, SIGALRM);
+        proc_table_unlock_irqrestore(tflags);
+        if (alrm_pending)
+            t->overrun++;
         callout_set_ticks(&t->co, t->interval_ticks, timer_expiry_fn, t);
     } else {
         t->armed = false;
     }
 }
 
-i32 posix_timer_create(struct proc *p)
+i32 posix_timer_settime_idx(u16 object_index,
+                            u64 value_ms,
+                            u64 interval_ms,
+                            u16 target_tid)
 {
-    if (!p)
+    if (object_index >= POSIX_TIMER_MAX)
         return -(i32) EINVAL;
 
-    u64 flags = spin_lock_irqsave(&timer_lock);
-    for (i32 i = 0; i < POSIX_TIMER_MAX; i++) {
-        if (!timer_pool[i].in_use) {
-            timer_pool[i].in_use = true;
-            timer_pool[i].owner = p;
-            timer_pool[i].owner_generation = p->generation;
-            timer_pool[i].armed = false;
-            timer_pool[i].overrun = 0;
-            timer_pool[i].interval_ticks = 0;
-            callout_init(&timer_pool[i].co);
-            spin_unlock_irqrestore(&timer_lock, flags);
-            return i;
-        }
-    }
-    spin_unlock_irqrestore(&timer_lock, flags);
-    return -(i32) EAGAIN;
-}
-
-i32 posix_timer_settime(i32 handle,
-                        struct proc *caller,
-                        u64 value_ms,
-                        u64 interval_ms,
-                        u16 target_tid)
-{
-    if (handle < 0 || handle >= POSIX_TIMER_MAX)
-        return -(i32) EINVAL;
-
-    struct posix_timer *t = &timer_pool[handle];
+    struct posix_timer *t = &timer_pool[object_index];
     if (!t->in_use)
         return -(i32) EINVAL;
-    if (!posix_timer_owner_matches(t, caller))
-        return -(i32) EPERM;
+    struct proc *caller = t->owner;
+    if (!caller || t->owner_generation != caller->generation)
+        return -(i32) EINVAL;
 
-    /* If a specific TID is requested, validate it is currently a live
-     * thread of the owning proc; reject up front so user space cannot
-     * set up a timer that silently fails to deliver later.
-     */
     if (target_tid != 0) {
         u64 tflags = proc_table_lock_irqsave();
         bool found = false;
@@ -182,14 +190,9 @@ i32 posix_timer_settime(i32 handle,
             return -(i32) ESRCH;
     }
 
-    /* Disarm any existing timer before reconfiguration.  Use synchronous
-     * cancel so an in-flight expiry callback cannot race with the new state.
-     */
     callout_cancel_sync(&t->co);
-
     t->target_tid = target_tid;
 
-    /* POSIX: value_ms == 0 means disarm the timer. */
     if (value_ms == 0) {
         t->armed = false;
         t->interval_ticks = 0;
@@ -197,9 +200,6 @@ i32 posix_timer_settime(i32 handle,
     }
 
     t->interval_ticks = (interval_ms > 0) ? time_ms_to_ticks(interval_ms) : 0;
-    /* Clamp sub-tick intervals to 1 tick to prevent silent one-shot
-     * degradation when time_ms_to_ticks rounds down to 0.
-     */
     if (interval_ms > 0 && t->interval_ticks == 0)
         t->interval_ticks = 1;
     t->overrun = 0;
@@ -213,48 +213,15 @@ i32 posix_timer_settime(i32 handle,
     return 0;
 }
 
-i32 posix_timer_delete(i32 handle, struct proc *caller)
+i64 posix_timer_gettime_idx(u16 object_index)
 {
-    if (handle < 0 || handle >= POSIX_TIMER_MAX)
-        return -(i32) EINVAL;
-
-    struct posix_timer *t = &timer_pool[handle];
-    if (!t->in_use)
-        return -(i32) EINVAL;
-    if (!posix_timer_owner_matches(t, caller))
-        return -(i32) EPERM;
-
-    /* Mark unarmed first so an in-flight callback bails out. */
-    t->armed = false;
-
-    /* Synchronous cancel: wait for any in-flight callback to complete
-     * before freeing the handle.  Plain callout_cancel is not sufficient
-     * because a periodic timer_expiry_fn could be mid-execution on another
-     * hart and would re-arm the callout after an async cancel returns.
-     */
-    callout_cancel_sync(&t->co);
-
-    u64 flags = spin_lock_irqsave(&timer_lock);
-    t->in_use = false;
-    t->owner = NULL;
-    t->owner_generation = 0;
-    spin_unlock_irqrestore(&timer_lock, flags);
-
-    return 0;
-}
-
-i64 posix_timer_gettime(i32 handle, struct proc *caller)
-{
-    if (handle < 0 || handle >= POSIX_TIMER_MAX)
+    if (object_index >= POSIX_TIMER_MAX)
         return -(i64) EINVAL;
-    struct posix_timer *t = &timer_pool[handle];
+    struct posix_timer *t = &timer_pool[object_index];
     if (!t->in_use)
         return -(i64) EINVAL;
-    if (!posix_timer_owner_matches(t, caller))
-        return -(i64) EPERM;
     if (!t->armed)
         return 0;
-    /* Compute actual remaining time from the callout's absolute deadline. */
     u64 now = time_rdtime();
     u64 deadline = t->co.deadline;
     if (deadline <= now)
@@ -262,15 +229,13 @@ i64 posix_timer_gettime(i32 handle, struct proc *caller)
     return (i64) time_ticks_to_ms(deadline - now);
 }
 
-i64 posix_timer_getoverrun(i32 handle, struct proc *caller)
+i64 posix_timer_getoverrun_idx(u16 object_index)
 {
-    if (handle < 0 || handle >= POSIX_TIMER_MAX)
+    if (object_index >= POSIX_TIMER_MAX)
         return -(i64) EINVAL;
-    struct posix_timer *t = &timer_pool[handle];
+    struct posix_timer *t = &timer_pool[object_index];
     if (!t->in_use)
         return -(i64) EINVAL;
-    if (!posix_timer_owner_matches(t, caller))
-        return -(i64) EPERM;
     return (i64) t->overrun;
 }
 
@@ -278,15 +243,8 @@ void posix_timer_teardown_proc(struct proc *p)
 {
     for (i32 i = 0; i < POSIX_TIMER_MAX; i++) {
         struct posix_timer *t = &timer_pool[i];
-        if (posix_timer_owner_matches(t, p)) {
-            t->armed = false;
-            callout_cancel_sync(&t->co);
-            u64 flags = spin_lock_irqsave(&timer_lock);
-            t->in_use = false;
-            t->owner = NULL;
-            t->owner_generation = 0;
-            spin_unlock_irqrestore(&timer_lock, flags);
-        }
+        if (t->in_use && t->owner == p && t->owner_generation == p->generation)
+            posix_timer_free(t);
     }
 }
 
@@ -294,6 +252,7 @@ static void posix_timer_boot_init(u32 flag __unused)
 {
     for (i32 i = 0; i < POSIX_TIMER_MAX; i++) {
         timer_pool[i].in_use = false;
+        timer_pool[i].refcount = 0;
         callout_init(&timer_pool[i].co);
     }
 }

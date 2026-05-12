@@ -6,7 +6,7 @@
 static i32 selftest_proc_alloc_free(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->magic == PROC_MAGIC);
     assert(p->state == PROC_STATE_EMBRYO);
     assert(p->pid > 0);
@@ -22,19 +22,19 @@ static i32 selftest_proc_alloc_free(void)
 }
 DEFINE_SELFTEST(proc_alloc_free, selftest_proc_alloc_free);
 
-static i32 selftest_proc_fd_table(void)
+static i32 selftest_proc_cap_fd_slots(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
-    assert(p->fd_table[PROC_FD_STDIN].is_open);
-    assert(p->fd_table[PROC_FD_STDOUT].is_open);
-    assert(p->fd_table[PROC_FD_STDERR].is_open);
+    assert(p);
+    assert(cap_fd_is_valid(p, PROC_FD_STDIN));
+    assert(cap_fd_is_valid(p, PROC_FD_STDOUT));
+    assert(cap_fd_is_valid(p, PROC_FD_STDERR));
     for (sz i = PROC_FD_STDERR + 1; i < PROC_FD_MAX; i++)
-        assert(!p->fd_table[i].is_open);
+        assert(!cap_fd_is_valid(p, (i32) i));
     proc_free(p);
     return 0;
 }
-DEFINE_SELFTEST(proc_fd_table, selftest_proc_fd_table);
+DEFINE_SELFTEST(proc_cap_fd_slots, selftest_proc_cap_fd_slots);
 
 static i32 selftest_proc_pid_wrap_collision(void)
 {
@@ -43,8 +43,8 @@ static i32 selftest_proc_pid_wrap_collision(void)
 
     struct proc *p1 = proc_alloc();
     struct proc *p2 = proc_alloc();
-    assert(p1 != NULL);
-    assert(p2 != NULL);
+    assert(p1);
+    assert(p2);
     assert(p1->pid == U16_MAX);
     assert(p2->pid == 1);
     assert(p1->pid != p2->pid);
@@ -59,7 +59,7 @@ DEFINE_SELFTEST(proc_pid_wrap_collision, selftest_proc_pid_wrap_collision);
 static i32 selftest_proc_vma_tracking(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->n_vmas == 0);
 
     /* Register a code VMA at USER_CODE_BASE, 2 pages. */
@@ -97,7 +97,7 @@ DEFINE_SELFTEST(proc_vma_tracking, selftest_proc_vma_tracking);
 static i32 selftest_proc_state_machine(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->state == PROC_STATE_EMBRYO);
 
     /* EMBRYO -> RUNNING */
@@ -119,7 +119,7 @@ DEFINE_SELFTEST(proc_state_machine, selftest_proc_state_machine);
 static i32 selftest_proc_sleeping_transition(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     proc_set_state(p, PROC_STATE_RUNNING);
 
     proc_set_state(p, PROC_STATE_SLEEPING);
@@ -141,23 +141,25 @@ static i32 selftest_proc_reparent_orphan(void)
     u16 save_next = next_pid;
     next_pid = 1;
     struct proc *init = proc_alloc();
-    assert(init != NULL);
+    assert(init);
     assert(init->pid == 1);
     proc_set_state(init, PROC_STATE_RUNNING);
 
     /* Allocate parent and two children. */
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     struct proc *c1 = proc_alloc();
-    assert(c1 != NULL);
+    assert(c1);
     c1->parent_pid = parent->pid;
+    c1->parent_generation = parent->generation;
     proc_set_state(c1, PROC_STATE_RUNNING);
 
     struct proc *c2 = proc_alloc();
-    assert(c2 != NULL);
+    assert(c2);
     c2->parent_pid = parent->pid;
+    c2->parent_generation = parent->generation;
     proc_set_state(c2, PROC_STATE_RUNNING);
 
     assert(proc_count_children(parent->pid) == 2);
@@ -189,16 +191,17 @@ static i32 selftest_proc_reparent_zombie(void)
     u16 save_next = next_pid;
     next_pid = 1;
     struct proc *init = proc_alloc();
-    assert(init != NULL && init->pid == 1);
+    assert(init && init->pid == 1);
     proc_set_state(init, PROC_STATE_RUNNING);
 
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     struct proc *child = proc_alloc();
-    assert(child != NULL);
+    assert(child);
     child->parent_pid = parent->pid;
+    child->parent_generation = parent->generation;
     proc_set_state(child, PROC_STATE_RUNNING);
     proc_set_state(child, PROC_STATE_ZOMBIE); /* child died first */
     u16 child_pid = child->pid;
@@ -228,14 +231,15 @@ DEFINE_SELFTEST(proc_reparent_zombie, selftest_proc_reparent_zombie);
 static i32 selftest_proc_multi_child_wait(void)
 {
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     struct proc *children[3];
     for (sz i = 0; i < 3; i++) {
         children[i] = proc_alloc();
-        assert(children[i] != NULL);
+        assert(children[i]);
         children[i]->parent_pid = parent->pid;
+        children[i]->parent_generation = parent->generation;
         proc_set_state(children[i], PROC_STATE_RUNNING);
     }
 
@@ -269,12 +273,13 @@ DEFINE_SELFTEST(proc_multi_child_wait, selftest_proc_multi_child_wait);
 static i32 selftest_proc_exit_lifecycle(void)
 {
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     struct proc *child = proc_alloc();
-    assert(child != NULL);
+    assert(child);
     child->parent_pid = parent->pid;
+    child->parent_generation = parent->generation;
     proc_set_state(child, PROC_STATE_RUNNING);
 
     u16 child_pid = child->pid;
@@ -309,12 +314,13 @@ DEFINE_SELFTEST(proc_exit_lifecycle, selftest_proc_exit_lifecycle);
 static i32 selftest_proc_slot_reuse(void)
 {
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     struct proc *child = proc_alloc();
-    assert(child != NULL);
+    assert(child);
     child->parent_pid = parent->pid;
+    child->parent_generation = parent->generation;
     proc_set_state(child, PROC_STATE_RUNNING);
 
     u32 gen = child->generation;
@@ -331,7 +337,7 @@ static i32 selftest_proc_slot_reuse(void)
 
     /* Can allocate again in that slot. */
     struct proc *reused = proc_alloc();
-    assert(reused != NULL);
+    assert(reused);
     /* The allocator may or may not give us the same slot, but the table
      * should have capacity.
      */
@@ -347,20 +353,22 @@ DEFINE_SELFTEST(proc_slot_reuse, selftest_proc_slot_reuse);
 static i32 selftest_proc_count_children(void)
 {
     struct proc *parent = proc_alloc();
-    assert(parent != NULL);
+    assert(parent);
     proc_set_state(parent, PROC_STATE_RUNNING);
 
     assert(proc_count_children(parent->pid) == 0);
 
     struct proc *c1 = proc_alloc();
-    assert(c1 != NULL);
+    assert(c1);
     c1->parent_pid = parent->pid;
+    c1->parent_generation = parent->generation;
     proc_set_state(c1, PROC_STATE_RUNNING);
     assert(proc_count_children(parent->pid) == 1);
 
     struct proc *c2 = proc_alloc();
-    assert(c2 != NULL);
+    assert(c2);
     c2->parent_pid = parent->pid;
+    c2->parent_generation = parent->generation;
     proc_set_state(c2, PROC_STATE_RUNNING);
     assert(proc_count_children(parent->pid) == 2);
 
@@ -395,7 +403,7 @@ DEFINE_SELFTEST(proc_count_children, selftest_proc_count_children);
 static i32 selftest_proc_task_list(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->n_tasks == 0);
     assert(proc_thread_group_leader(p) == NULL);
     /* Transition to RUNNING so proc_reserve_thread_slot accepts the

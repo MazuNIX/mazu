@@ -7,6 +7,7 @@
  */
 
 #include <mazu/assert.h>
+#include <mazu/cap.h>
 #include <mazu/eventlog.h>
 #include <mazu/kvalloc.h>
 #include <mazu/paging.h>
@@ -22,8 +23,6 @@
 #include "../sync/futex.h"
 #include "../sync/sync_handle.h"
 #include "../timer/posix_timer.h"
-#include "pipe.h"
-
 static struct proc proc_table[PROC_MAX];
 spinlock_t proc_table_lock = SPINLOCK_INITIALIZER;
 static u16 next_pid = 1;
@@ -39,10 +38,28 @@ static sz proc_slot(struct proc *p)
     return (sz) (p - proc_table);
 }
 
+static bool proc_child_matches_parent(const struct proc *child,
+                                      const struct proc *parent)
+{
+    return child && parent && child != parent &&
+           child->parent_pid == parent->pid &&
+           child->parent_generation == parent->generation;
+}
+
 static vaddr_t proc_thread_stack_top(const struct proc *p, u8 slot)
 {
     return (vaddr_t) (p->va_stack_top -
                       (u64) slot * (USER_STACK_SIZE + PAGE_SIZE));
+}
+
+static i32 proc_detach_thread_cap_slot_locked(struct sched_task *td)
+{
+    if (!td || td->td_cap_slot < 0)
+        return -1;
+
+    i32 slot = td->td_cap_slot;
+    td->td_cap_slot = -1;
+    return slot;
 }
 
 u64 proc_table_lock_irqsave(void)
@@ -105,30 +122,6 @@ static u16 proc_alloc_pid_locked(void)
     return 0;
 }
 
-static void proc_close_fd_impl(struct proc *p, i32 fd)
-{
-    struct proc_fd *f = &p->fd_table[fd];
-    if (!f->is_open)
-        return;
-
-    /* Release the underlying resource before clearing the slot.
-     * The is_seekable check (instead of fd > PROC_FD_STDERR) ensures
-     * vfs_close runs for VFS files redirected onto stdio via spawn
-     * file actions.  Console FDs (is_seekable == false) are skipped.
-     */
-    if (f->is_pipe) {
-        if (f->pipe_read_end)
-            pipe_close_read(f->pipe);
-        else
-            pipe_close_write(f->pipe);
-    } else if (f->is_seekable && !f->is_dup) {
-        vfs_close(&f->file);
-    }
-
-    /* Zero the entire slot to reset all fields at once. */
-    memset(f, 0, sizeof(*f));
-}
-
 static void proc_free_locked(struct proc *p)
 {
     MAGIC_CHECK(p, PROC_MAGIC);
@@ -137,10 +130,7 @@ static void proc_free_locked(struct proc *p)
 
     proc_free_user_pages(p);
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    for (i32 i = 0; i < PROC_FD_MAX; i++)
-        proc_close_fd_impl(p, i);
-    proc_fd_unlock_irqrestore(p, fd_flags);
+    cap_space_teardown(p);
 
     p->n_vmas = 0;
     p->generation++;
@@ -153,6 +143,7 @@ void proc_init(void)
     memset(proc_table, 0, sizeof(proc_table));
     proc_table_lock = (spinlock_t) SPINLOCK_INITIALIZER;
     next_pid = 1;
+    cap_init();
     for (sz i = 0; i < PROC_MAX; i++) {
         init_waitqueue_head(&child_wqs[i]);
         init_waitqueue_head(&proc_table[i].thread_event_wq);
@@ -204,9 +195,6 @@ struct proc *proc_alloc(void)
             p->fd_lock = (spinlock_t) SPINLOCK_INITIALIZER;
             p->sig_lock = (spinlock_t) SPINLOCK_INITIALIZER;
             init_waitqueue_head(&p->thread_event_wq);
-            p->fd_table[PROC_FD_STDIN].is_open = true;
-            p->fd_table[PROC_FD_STDOUT].is_open = true;
-            p->fd_table[PROC_FD_STDERR].is_open = true;
             p->cwd[0] = '/';
             p->cwd_len = 1;
             /* Assign per-process VA window based on table slot index.
@@ -220,6 +208,7 @@ struct proc *proc_alloc(void)
              * Ensures a clean list head regardless of prior state.
              */
             init_waitqueue_head(&child_wqs[i]);
+            cap_space_init(p);
             proc_table_unlock_irqrestore(flags);
             return p;
         }
@@ -343,18 +332,35 @@ void proc_release_thread_stack(struct proc *p, u8 slot)
     proc_remove_vma(p, stack_bottom, USER_STACK_SIZE);
 }
 
-void proc_reap_exited_thread_locked(struct proc *p, struct sched_task *td)
+static void proc_drop_thread_token(struct proc *p, i64 token)
+{
+    assert(p);
+    if (token < 0)
+        return;
+
+    (void) cap_drop_token(p, (u64) token);
+}
+
+i64 proc_reap_exited_thread_locked(struct proc *p, struct sched_task *td)
 {
     assert(p);
     if (!td)
-        return;
+        return -1;
 
+    i64 token = -1;
     u8 slot = proc_task_slot(p, td);
     if (slot < PROC_THREAD_MAX) {
+        i32 cap_slot = proc_detach_thread_cap_slot_locked(td);
+        if (cap_slot >= 0) {
+            struct cap_slot_view cap_slot_view = cap_slot_read(p, cap_slot);
+            if (cap_slot_view.valid && cap_slot_view.type == CAP_TYPE_THREAD)
+                token = (i64) cap_make_handle(&cap_slot_view);
+        }
         p->exited_cpu_time_us += td->cpu_time_us;
         proc_release_thread_stack(p, slot);
         proc_detach_task(p, td);
     }
+    return token;
 }
 
 void proc_reap_exited_thread(struct proc *p, struct sched_task *td)
@@ -364,22 +370,21 @@ void proc_reap_exited_thread(struct proc *p, struct sched_task *td)
         return;
 
     u64 pflags = proc_table_lock_irqsave();
-    proc_reap_exited_thread_locked(p, td);
+    i64 token = proc_reap_exited_thread_locked(p, td);
     proc_table_unlock_irqrestore(pflags);
+    proc_drop_thread_token(p, token);
 }
 
 void proc_close_fd_locked(struct proc *p, i32 fd)
 {
     assert(p);
     assert(fd >= 0 && fd < PROC_FD_MAX);
-    proc_close_fd_impl(p, fd);
+    (void) cap_close_fd(p, fd);
 }
 
 void proc_close_fd(struct proc *p, i32 fd)
 {
-    u64 flags = proc_fd_lock_irqsave(p);
-    proc_close_fd_impl(p, fd);
-    proc_fd_unlock_irqrestore(p, flags);
+    (void) cap_close_fd(p, fd);
 }
 
 void proc_free(struct proc *p)
@@ -407,6 +412,73 @@ struct proc *proc_find(u16 pid)
     return p;
 }
 
+sz proc_collect_descendants_locked(struct proc *root,
+                                   u32 root_generation,
+                                   struct proc **out,
+                                   u32 *out_generations,
+                                   sz max)
+{
+    if (!root || !out || !out_generations || max == 0)
+        return 0;
+
+    if (root->state == PROC_STATE_FREE || root->generation != root_generation)
+        return 0;
+
+    sz count = 0;
+    out[count] = root;
+    out_generations[count] = root->generation;
+    count++;
+
+    bool added = true;
+    while (added && count < max) {
+        added = false;
+        for (sz i = 0; i < PROC_MAX && count < max; i++) {
+            struct proc *candidate = &proc_table[i];
+            if (candidate->state == PROC_STATE_FREE)
+                continue;
+
+            bool is_descendant = false;
+            for (sz j = 0; j < count; j++) {
+                if (proc_child_matches_parent(candidate, out[j])) {
+                    is_descendant = true;
+                    break;
+                }
+            }
+            if (!is_descendant)
+                continue;
+
+            bool already_listed = false;
+            for (sz j = 0; j < count; j++) {
+                if (out[j] == candidate) {
+                    already_listed = true;
+                    break;
+                }
+            }
+            if (already_listed)
+                continue;
+
+            out[count] = candidate;
+            out_generations[count] = candidate->generation;
+            count++;
+            added = true;
+        }
+    }
+    return count;
+}
+
+sz proc_collect_descendants(struct proc *root,
+                            u32 root_generation,
+                            struct proc **out,
+                            u32 *out_generations,
+                            sz max)
+{
+    u64 flags = proc_table_lock_irqsave();
+    sz count = proc_collect_descendants_locked(root, root_generation, out,
+                                               out_generations, max);
+    proc_table_unlock_irqrestore(flags);
+    return count;
+}
+
 void proc_for_each(proc_iter_cb_t cb, void *ctx)
 {
     u64 flags = proc_table_lock_irqsave();
@@ -421,7 +493,7 @@ static bool has_zombie_child_locked(struct proc *parent)
 {
     for (sz i = 0; i < PROC_MAX; i++) {
         if (proc_table[i].state == PROC_STATE_ZOMBIE &&
-            proc_table[i].parent_pid == parent->pid)
+            proc_child_matches_parent(&proc_table[i], parent))
             return true;
     }
     return false;
@@ -434,7 +506,7 @@ static bool has_any_child_locked(struct proc *parent)
         if (i == proc_slot(parent))
             continue;
         if (proc_table[i].state != PROC_STATE_FREE &&
-            proc_table[i].parent_pid == parent->pid)
+            proc_child_matches_parent(&proc_table[i], parent))
             return true;
     }
     return false;
@@ -456,7 +528,8 @@ void proc_notify_parent(struct proc *child)
     u64 flags = proc_table_lock_irqsave();
     for (sz i = 0; i < PROC_MAX; i++) {
         if (proc_table[i].state != PROC_STATE_FREE &&
-            proc_table[i].pid == child->parent_pid) {
+            proc_table[i].pid == child->parent_pid &&
+            proc_table[i].generation == child->parent_generation) {
             wake_slot = i;
             break;
         }
@@ -695,21 +768,24 @@ void proc_reparent_children(struct proc *parent)
     for (sz i = 0; i < PROC_MAX; i++) {
         if (proc_table[i].state == PROC_STATE_FREE)
             continue;
-        if (proc_table[i].parent_pid != parent->pid)
+        if (!proc_child_matches_parent(&proc_table[i], parent))
             continue;
         if (&proc_table[i] == parent)
             continue;
 
         if (init_alive) {
             proc_table[i].parent_pid = 1;
+            proc_table[i].parent_generation = init->generation;
             if (proc_table[i].state == PROC_STATE_ZOMBIE)
                 need_wake_init = true;
         } else {
             /* No init: auto-reap zombie children. */
             if (proc_table[i].state == PROC_STATE_ZOMBIE)
                 proc_free_locked(&proc_table[i]);
-            else
+            else {
                 proc_table[i].parent_pid = 0; /* true orphan */
+                proc_table[i].parent_generation = 0;
+            }
         }
     }
     proc_table_unlock_irqrestore(flags);
@@ -795,7 +871,8 @@ void proc_exit(struct proc *p, i32 exit_code)
     for (sz i = 0; i < PROC_MAX; i++) {
         if (proc_table[i].state != PROC_STATE_FREE &&
             proc_table[i].state != PROC_STATE_ZOMBIE &&
-            proc_table[i].pid == p->parent_pid) {
+            proc_table[i].pid == p->parent_pid &&
+            proc_table[i].generation == p->parent_generation) {
             parent_slot = i;
             break;
         }

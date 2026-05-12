@@ -100,7 +100,7 @@ The following PSE51 services are present and exercised by selftests
 | `clock_gettime` | `SYS_CLOCK_GETTIME` | implemented | `CLOCK_MONOTONIC`, `CLOCK_REALTIME`, `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID`. |
 | `clock_getres` | `SYS_CLOCK_GETRES` | implemented | Resolution derives from the timebase frequency; sub-millisecond on QEMU `virt`. |
 | `clock_settime` | (none) | not-applicable | Realtime clock is anchored to boot ticks; no settable wall clock yet. |
-| `clock_nanosleep` | (none) | stubbed | The relative form is covered by `nanosleep`; the absolute form is tracked under PSE51 ABI alignment work in `TODO.md`. |
+| `clock_nanosleep` | (none) | stubbed | The relative form is covered by `nanosleep`; the absolute form is tracked under PSE51 ABI alignment work. |
 | `nanosleep` | `SYS_NANOSLEEP` | implemented-with-mazu-abi | Accepts `struct timespec`. On `EINTR` the kernel writes the unexpired remainder to `*rem` when `rem` is non-NULL (best-effort: a bad `rem` pointer does not mask the `EINTR` return). On normal completion `*rem` is unmodified. `tv_sec` is bounded against u64 overflow to keep the kernel-side ns/ms conversion safe. |
 
 ## Synchronization (kernel handles)
@@ -124,14 +124,13 @@ sync handle table (`kernel/sync/sync_handle.c`).
 
 | Interface (POSIX) | Mazu syscall | Status | Notes |
 |---|---|---|---|
-| `pthread_self` | `SYS_THREAD_SELF` | implemented | Returns `td->id`. |
-| `pthread_create` | `SYS_THREAD_CREATE` | implemented | PROC_THREAD_MAX = 4. Slot reservation under `proc_table_lock`, per-thread stack VA inside the proc slot. Priority inherits from creator; an explicit priority arg ABI is a future extension. |
-| `pthread_join` | `SYS_THREAD_JOIN` | implemented | Blocks on `target->td_join_wq`; atomically claims `EXITED -> REAPED` via cmpxchg before reaping. EDEADLK on self-join, ESRCH on unknown TID, EINVAL on detached/already-reaped, EINTR on cancellation. |
+| `pthread_self` | `SYS_THREAD_SELF` | implemented | Returns the caller's `CAP_TYPE_THREAD` small-int handle. |
+| `pthread_create` | `SYS_THREAD_CREATE` | implemented | PROC_THREAD_MAX = 4. Slot reservation under `proc_table_lock`, per-thread stack VA inside the proc slot. Returns a fresh `CAP_TYPE_THREAD` handle. Priority inherits from creator; an explicit priority arg ABI is a future extension. |
+| `pthread_join` | `SYS_THREAD_JOIN` | implemented | Blocks on `target->td_join_wq`; atomically claims `EXITED -> REAPED` via cmpxchg before reaping. EDEADLK on self-join, ESRCH on unknown thread handle, EINVAL on detached/already-reaped, EINTR on cancellation. |
 | `pthread_detach` | `SYS_THREAD_DETACH` | implemented | Tries `JOINABLE -> DETACHED` first; if the target already exited, claims `EXITED -> REAPED` and reaps inline. Either claim wakes pending joiners. |
 | `pthread_exit` | `SYS_THREAD_EXIT` | implemented | Last-thread exit collapses into `proc_exit`; non-last exit unwinds the thread's robust futex list. A user thread that returns from its entry function lands on the per-process unmapped trampoline at `signal_trampoline_pc(p)+4`; the trap handler synthesizes `SYS_THREAD_EXIT(0)`, so an implicit return is equivalent to an explicit pthread_exit. |
-| `pthread_setschedparam` / `_getschedparam` | `SYS_THREAD_SETSCHEDPARAM` / `_GETSCHEDPARAM` | implemented-with-mazu-abi | Take a kernel TID (0 = self) and a scalar priority. Privilege bound: cannot raise above caller's own base priority. |
+| `pthread_setschedparam` / `_getschedparam` | `SYS_THREAD_SETSCHEDPARAM` / `_GETSCHEDPARAM` | implemented-with-mazu-abi | Take a `CAP_TYPE_THREAD` handle (0 = self) and a scalar priority. Privilege bound: cannot raise above caller's own base priority. |
 | `pthread_attr_*` | (libc) | stubbed | Attribute objects (`setstack`, `setdetachstate`, `setschedpolicy`, `setschedparam`, `setinheritsched`) are user-space libc concerns, but a "PSE51 complete" claim requires them to exist somewhere in the toolchain image. Mazu does not ship a libc with these wrappers today. The kernel ABI accepts the resolved (entry, arg, stack, prio) tuple; once a libc lands, this row flips to `not-applicable`. |
-| `pthread_setschedparam` / `_getschedparam` | (none) | stubbed | Today scalar priority is set via `SYS_SCHED_SETPARAM` / `_GETPARAM` on the calling thread only. Per-thread policy/priority change blocked on per-thread sched-parameter state migration. |
 | `pthread_spin_init` / `_lock` / `_trylock` / `_unlock` / `_destroy` | (none) | stubbed | Mazu has kernel-internal spinlocks, but no userspace-visible busy-wait primitive. The `_POSIX_SPIN_LOCKS` macro is therefore intentionally *not* defined and `_SC_SPIN_LOCKS` returns -1 — advertising it would let an app gate on the macro and call absent APIs. Expect a libc-side implementation backed by a futex once threads land, not a kernel syscall. |
 | `pthread_cancel` / `pthread_setcancelstate` / `pthread_testcancel` | `SYS_THREAD_CANCEL` / `SYS_THREAD_SETCANCELSTATE` / `SYS_THREAD_TESTCANCEL` | implemented | Deferred cancellation: pthread_cancel sets `td_cancel_pending`; the target observes the bit at the next cancellation point and exits with code -ECANCELED. ASYNC type is treated as DEFERRED because Mazu has no in-kernel cancellation points other than blocking syscalls. |
 
@@ -143,7 +142,7 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | `sigaction` | `SYS_SIGACTION` | implemented | Per-process disposition. `sa_mask` is a `u32` bitmask, not `sigset_t`. |
 | `sigreturn` | `SYS_SIGRETURN` | implemented | Cookie-validated frame teardown. |
 | `pthread_sigmask` | `SYS_PTHREAD_SIGMASK` | implemented | Same wire shape as `SYS_SIGPROCMASK`; both operate on the calling thread's `td_sig.blocked`. Distinct syscall numbers so libc can keep `pthread_sigmask` and `sigprocmask` as separate ABI surfaces. |
-| `pthread_kill` | `SYS_PTHREAD_KILL` | implemented | Thread-directed signal: bit lands on the named thread's `td_sig.pending` rather than the per-proc `proc_pending` mask. SIGKILL rejected with EINVAL (must be process-wide). |
+| `pthread_kill` | `SYS_PTHREAD_KILL` | implemented | Thread-directed signal: bit lands on the named thread's `td_sig.pending` rather than the per-proc `proc_pending` mask. Takes a `CAP_TYPE_THREAD` handle. SIGKILL rejected with EINVAL (must be process-wide). |
 | `sigsuspend` | `SYS_SIGSUSPEND` | implemented | Replace blocked mask with the supplied set, yield-loop until a deliverable signal arrives, restore prior mask, return EINTR. |
 | `sigtimedwait` / `sigwait` / `sigwaitinfo` | `SYS_SIGTIMEDWAIT` | implemented-with-mazu-abi | Block until any signal in the supplied set is pending; dequeue without invoking the handler; return signo. Honors `struct timespec *` timeout (NULL = wait forever; expired = EAGAIN). |
 | `sigqueue` value delivery | (none) | stubbed | Mazu signals are level-style: a single bit per signal in `pending`, no per-signal value queue. The wait API set above advertises `_POSIX_REALTIME_SIGNALS = 1` (subset) but `sigqueue` with a payload value requires an additional bounded queue subsystem. |
@@ -154,7 +153,7 @@ sync handle table (`kernel/sync/sync_handle.c`).
 
 | Interface (POSIX) | Mazu syscall | Status | Notes |
 |---|---|---|---|
-| `timer_create` | `SYS_TIMER_CREATE` | implemented-with-mazu-abi | Pool-allocated (8 timers per process). Signal number is fixed to `SIGALRM`; the per-call target thread (`SIGEV_THREAD_ID`) is supplied via `posix_timer_settime`'s new `target_tid` parameter (a3 of `SYS_TIMER_SETTIME`); pass 0 for process-directed delivery. If the targeted thread has already exited at expiry, the signal is silently dropped (POSIX strict). |
+| `timer_create` | `SYS_TIMER_CREATE` | implemented-with-mazu-abi | Pool-allocated (8 timers per process). Signal number is fixed to `SIGALRM`; the per-call target thread (`SIGEV_THREAD_ID`) is supplied via `posix_timer_settime`'s new thread-handle parameter (a3 of `SYS_TIMER_SETTIME`); pass 0 for process-directed delivery. If the targeted thread has already exited at expiry, the signal is silently dropped (POSIX strict). |
 | `timer_settime` | `SYS_TIMER_SETTIME` | implemented-with-mazu-abi | ABI takes `u64 value_ms, u64 interval_ms` instead of `struct itimerspec`. `value_ms == 0` disarms (POSIX semantics). |
 | `timer_gettime` | `SYS_TIMER_GETTIME` | implemented-with-mazu-abi | Returns remaining milliseconds as a scalar. |
 | `timer_getoverrun` | `SYS_TIMER_GETOVERRUN` | implemented | Increments only while the previous `SIGALRM` is still pending (POSIX overrun semantics). |
@@ -278,8 +277,7 @@ The bounded multi-threaded process model is in place: per-thread
 state migration (signal pending/blocked, signal-frame chain, robust
 futex list, errno TLS) and the user-visible pthread surface
 (`SYS_THREAD_CREATE` and friends) have both landed, with
-`PROC_THREAD_MAX = 4`. The two remaining gaps, tracked as
-non-blocking follow-ups in `TODO.md`, are the `sigqueue` payload
+`PROC_THREAD_MAX = 4`. The two remaining gaps are the `sigqueue` payload
 queue (requires a bounded per-signal queue subsystem) and the
 `pthread_attr_*` libc family (strictly a libc-side concern; the
 kernel ABI already accepts the resolved (entry, arg, prio) tuple).

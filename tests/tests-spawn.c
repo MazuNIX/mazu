@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include <mazu/cap.h>
 #include <mazu/selftest.h>
 #include <mazu/spawn.h>
 #include <mazu/vfs.h>
@@ -18,7 +19,7 @@ static bool spawn_test_vfs_available(void)
 static i32 selftest_spawn_fa_close(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* FDs 0/1/2 are open by default. Close FD 1 (stdout). */
     struct spawn_file_action fa = {
@@ -27,11 +28,11 @@ static i32 selftest_spawn_fa_close(void)
     };
     i32 rc = spawn_apply_file_actions(p, &fa, 1);
     assert(rc == 0);
-    assert(!p->fd_table[PROC_FD_STDOUT].is_open);
+    assert(!cap_fd_is_valid(p, PROC_FD_STDOUT));
 
     /* FDs 0 and 2 should still be open. */
-    assert(p->fd_table[PROC_FD_STDIN].is_open);
-    assert(p->fd_table[PROC_FD_STDERR].is_open);
+    assert(cap_fd_is_valid(p, PROC_FD_STDIN));
+    assert(cap_fd_is_valid(p, PROC_FD_STDERR));
 
     proc_free(p);
     return 0;
@@ -42,7 +43,7 @@ DEFINE_SELFTEST(spawn_fa_close, selftest_spawn_fa_close);
 static i32 selftest_spawn_fa_dup2(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Dup FD 0 (stdin) to FD 5. */
     struct spawn_file_action fa = {
@@ -52,8 +53,8 @@ static i32 selftest_spawn_fa_dup2(void)
     };
     i32 rc = spawn_apply_file_actions(p, &fa, 1);
     assert(rc == 0);
-    assert(p->fd_table[5].is_open);
-    assert(p->fd_table[5].is_dup);
+    assert(cap_fd_is_valid(p, 5));
+    assert(cap_fd_is_valid(p, PROC_FD_STDIN));
 
     proc_free(p);
     return 0;
@@ -67,7 +68,7 @@ static i32 selftest_spawn_fa_open(void)
         return 0; /* skip gracefully */
 
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     char path[] = "/hello.txt";
     struct spawn_file_action fa = {
@@ -78,9 +79,8 @@ static i32 selftest_spawn_fa_open(void)
     };
     i32 rc = spawn_apply_file_actions(p, &fa, 1);
     assert(rc == 0);
-    assert(p->fd_table[5].is_open);
-    assert(p->fd_table[5].is_seekable);
-    assert(!p->fd_table[5].is_dup);
+    assert(cap_fd_is_valid(p, 5));
+    assert(cap_fd_is_seekable(p, 5));
 
     proc_free(p);
     return 0;
@@ -94,7 +94,7 @@ static i32 selftest_spawn_fa_open_replace(void)
         return 0;
 
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     char path[] = "/hello.txt";
     struct spawn_file_action fa = {
@@ -105,8 +105,8 @@ static i32 selftest_spawn_fa_open_replace(void)
     };
     i32 rc = spawn_apply_file_actions(p, &fa, 1);
     assert(rc == 0);
-    assert(p->fd_table[PROC_FD_STDIN].is_open);
-    assert(p->fd_table[PROC_FD_STDIN].is_seekable);
+    assert(cap_fd_is_valid(p, PROC_FD_STDIN));
+    assert(cap_fd_is_seekable(p, PROC_FD_STDIN));
 
     proc_free(p);
     return 0;
@@ -120,7 +120,7 @@ static i32 selftest_spawn_fa_multi(void)
         return 0;
 
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     char path[] = "/hello.txt";
     struct spawn_file_action fas[3] = {
@@ -137,10 +137,9 @@ static i32 selftest_spawn_fa_multi(void)
 
     i32 rc = spawn_apply_file_actions(p, fas, 3);
     assert(rc == 0);
-    assert(!p->fd_table[PROC_FD_STDERR].is_open);
-    assert(p->fd_table[3].is_open);
-    assert(p->fd_table[4].is_open);
-    assert(p->fd_table[4].is_dup);
+    assert(!cap_fd_is_valid(p, PROC_FD_STDERR));
+    assert(cap_fd_is_valid(p, 3));
+    assert(cap_fd_is_valid(p, 4));
 
     proc_free(p);
     return 0;
@@ -151,7 +150,7 @@ DEFINE_SELFTEST(spawn_fa_multi, selftest_spawn_fa_multi);
 static i32 selftest_spawn_fa_invalid_type(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     struct spawn_file_action fa = {
         .type = 99,
@@ -169,7 +168,7 @@ DEFINE_SELFTEST(spawn_fa_invalid_type, selftest_spawn_fa_invalid_type);
 static i32 selftest_spawn_fa_bad_fd(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     struct spawn_file_action fa = {
         .type = SPAWN_FA_CLOSE,
@@ -187,7 +186,7 @@ DEFINE_SELFTEST(spawn_fa_bad_fd, selftest_spawn_fa_bad_fd);
 static i32 selftest_spawn_fa_too_many(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     struct spawn_file_action fas[1]; /* dummy, count matters */
     i32 rc = spawn_apply_file_actions(p, fas, SPAWN_FA_MAX + 1);
@@ -252,21 +251,91 @@ static i32 selftest_spawn_attr_noop(void)
 }
 DEFINE_SELFTEST(spawn_attr_noop, selftest_spawn_attr_noop);
 
+/* File actions run in caller order. dup2(3,4) followed by close(3)
+ * must leave fd 4 open while closing only the source slot.
+ */
+static i32 selftest_spawn_fa_dup2_then_close_order(void)
+{
+    struct proc *p = proc_alloc();
+    assert(p);
+
+    struct spawn_file_action fas[2] = {
+        {.type = SPAWN_FA_DUP2, .fd = PROC_FD_STDIN, .newfd = 4},
+        {.type = SPAWN_FA_CLOSE, .fd = PROC_FD_STDIN},
+    };
+
+    i32 rc = spawn_apply_file_actions(p, fas, 2);
+    assert(rc == 0);
+    assert(cap_fd_is_valid(p, 4));
+    assert(!cap_fd_is_valid(p, PROC_FD_STDIN));
+
+    proc_free(p);
+    return 0;
+}
+DEFINE_SELFTEST(spawn_fa_dup2_then_close_order,
+                selftest_spawn_fa_dup2_then_close_order);
+
+/* File actions must observe earlier child-side dup2 mutations. */
+static i32 selftest_spawn_fa_dup2_chain_order(void)
+{
+    struct proc *p = proc_alloc();
+    assert(p);
+
+    struct spawn_file_action fas[2] = {
+        {.type = SPAWN_FA_DUP2, .fd = PROC_FD_STDIN, .newfd = 3},
+        {.type = SPAWN_FA_DUP2, .fd = 3, .newfd = 4},
+    };
+
+    i32 rc = spawn_apply_file_actions(p, fas, 2);
+    assert(rc == 0);
+    assert(cap_fd_is_valid(p, 3));
+    assert(cap_fd_is_valid(p, 4));
+
+    proc_free(p);
+    return 0;
+}
+DEFINE_SELFTEST(spawn_fa_dup2_chain_order, selftest_spawn_fa_dup2_chain_order);
+
 /* Test zero file actions is a no-op. */
 static i32 selftest_spawn_fa_zero(void)
 {
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
 
     i32 rc = spawn_apply_file_actions(p, NULL, 0);
     assert(rc == 0);
 
     /* All default FDs should still be open. */
-    assert(p->fd_table[PROC_FD_STDIN].is_open);
-    assert(p->fd_table[PROC_FD_STDOUT].is_open);
-    assert(p->fd_table[PROC_FD_STDERR].is_open);
+    assert(cap_fd_is_valid(p, PROC_FD_STDIN));
+    assert(cap_fd_is_valid(p, PROC_FD_STDOUT));
+    assert(cap_fd_is_valid(p, PROC_FD_STDERR));
 
     proc_free(p);
     return 0;
 }
 DEFINE_SELFTEST(spawn_fa_zero, selftest_spawn_fa_zero);
+
+static i32 selftest_spawn_fa_open_grants_inherit(void)
+{
+    if (!spawn_test_vfs_available())
+        return 0;
+
+    struct proc *p = proc_alloc();
+    assert(p);
+
+    char path[] = "/hello.txt";
+    struct spawn_file_action fa = {
+        .type = SPAWN_FA_OPEN,
+        .fd = 5,
+        .pathlen = 10,
+        .path = (u64) (uptr) path,
+    };
+    i32 rc = spawn_apply_file_actions(p, &fa, 1);
+    assert(rc == 0);
+    assert(cap_fd_has_rights(p, 5, CAP_RIGHT_GRANT));
+
+    proc_free(p);
+    return 0;
+}
+DEFINE_SELFTEST(spawn_fa_open_grants_inherit,
+                selftest_spawn_fa_open_grants_inherit);

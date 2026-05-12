@@ -57,7 +57,7 @@ static i32 test_pse51_mutex(void)
     i32 h = sync_mutex_alloc(NULL);
     SELFTEST_ASSERT(h >= 0, 1);
 
-    struct pi_mutex *m = sync_mutex_get(h, NULL);
+    struct pi_mutex *m = sync_mutex_get(h);
     SELFTEST_ASSERT(m != NULL, 2);
 
     pi_mutex_lock(m);
@@ -77,7 +77,7 @@ static i32 test_pse51_sem(void)
     i32 h = sync_sem_alloc(NULL, 1);
     SELFTEST_ASSERT(h >= 0, 1);
 
-    struct semaphore *s = sync_sem_get(h, NULL);
+    struct semaphore *s = sync_sem_get(h);
     SELFTEST_ASSERT(s != NULL, 2);
 
     sem_wait(s);
