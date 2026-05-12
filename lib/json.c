@@ -274,6 +274,8 @@ static struct json_result jp_parse_array(struct json_parser *p)
     val.type = JSON_ARRAY;
     val.v.array.count = count;
     if (count > 0) {
+        if (count > SIZE_MAX / sizeof(struct json_value))
+            return jp_error(p, JSON_ERR_OVERFLOW);
         val.v.array.items =
             arena_alloc_array(p->arena, count, sizeof(struct json_value));
         memcpy(val.v.array.items, tmp_items, count * sizeof(struct json_value));
@@ -349,6 +351,8 @@ static struct json_result jp_parse_object(struct json_parser *p)
     val.type = JSON_OBJECT;
     val.v.object.count = count;
     if (count > 0) {
+        if (count > SIZE_MAX / sizeof(struct json_kv))
+            return jp_error(p, JSON_ERR_OVERFLOW);
         val.v.object.pairs =
             arena_alloc_array(p->arena, count, sizeof(struct json_kv));
         memcpy(val.v.object.pairs, tmp_pairs, count * sizeof(struct json_kv));
