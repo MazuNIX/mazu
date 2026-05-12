@@ -1,0 +1,39 @@
+kernel/proc/signal.h
+  s_29f8110b614d4a::t_92ddad4a95c90c 67-92
+tests/tests-syscall.c
+  s_29f8110b614d4a::t_9149d3beb9cf0c 1541-1707,1799-1850,1863-1865
+  s_29f8110b614d4a::t_60a8d81ceb00c3 1708-1712,1714,1721,1723-1776,1781,1788
+  s_29f8110b614d4a::t_41c7f6a0fbc6f9 1713,1715-1720,1722,1777-1780,1782-1787,1789-1798
+  s_29f8110b614d4a::t_d57298bc463844 1851-1862
+docs/pse51-matrix.md
+  s_29f8110b614d4a::t_4bdeb950b2e859 143
+include/mazu/proc.h
+  s_29f8110b614d4a::t_4a7752baa121ba 26-34,42-43
+  s_29f8110b614d4a::t_8a3bc58fb03d73 51-62,67
+kernel/proc/signal.c
+  s_29f8110b614d4a::t_d1fc5de8ed44e4 78,83-89,91,93-113
+  s_29f8110b614d4a::t_eb30a5b49bad38 29-30
+  s_29f8110b614d4a::t_3c8a7d9515bed4 141
+  s_29f8110b614d4a::t_91d6dfc2c6a8c0 52-73,79-82,90,92
+  s_29f8110b614d4a::t_8555396975d9aa 244-245,268-356
+kernel/proc/syscall.c
+  s_29f8110b614d4a::t_2dee0475a86265 2519-2522,2529-2549
+include/mazu/syscall.h
+  s_29f8110b614d4a::t_5f165d24b12170 191,194-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "29a084be01a87ae4ce7002304ae94e0616617df7",
+  "prompts": {},
+  "sessions": {
+    "s_29f8110b614d4a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "278fa877-b241-4bcb-9e36-7a6e667f7db3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
