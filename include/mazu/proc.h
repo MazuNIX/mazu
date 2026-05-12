@@ -22,6 +22,16 @@
 
 /* PSE51 signal state.  31 signals (1-31) in a 32-bit bitmask. */
 #define SIG_MAX 32
+#define SIGQUEUE_MAX_PER_SIGNO 4
+
+/* Internal ring capacity is one greater than the user-visible cap so that a
+ * sigtimedwait consumer that has already dequeued a payload can always put
+ * it back if copy_to_user faults after the lock was dropped, even if a
+ * concurrent sigqueue producer filled the slot we vacated. Producers still
+ * cap at SIGQUEUE_MAX_PER_SIGNO, so EAGAIN behavior is unchanged for user
+ * space.
+ */
+#define SIGQUEUE_RING_CAP (SIGQUEUE_MAX_PER_SIGNO + 1)
 typedef void (*sig_handler_fn_t)(i32);
 struct sigaction_entry {
     sig_handler_fn_t handler;
@@ -29,16 +39,33 @@ struct sigaction_entry {
     u32 sa_flags;
 };
 
+struct signal_value_queue {
+    u64 values[SIGQUEUE_RING_CAP];
+    u8 head;
+    u8 tail;
+    u8 count;
+};
+
 /* Per-process signal state. The blocked mask and signal-frame chain live
  * per-thread (struct sched_task::td_sig); the disposition table stays
- * per-process per POSIX. proc_pending holds process-directed signals that have
- * not yet been claimed by any specific thread; the return-to-user delivery
- * path folds it into each thread's local pending view, preserving the bit even
- * if the thread that the sender first observed has since exited.
+ * per-process per POSIX.
+ *
+ * Process-directed pending state has two distinct sources that must not be
+ * conflated:
+ *   - proc_pending_plain: kill()-style instances (no queued payload). One bit
+ *     per signo records "at least one plain instance is in flight".
+ *   - queued[signo].count: sigqueue()-style payload instances, FIFO.
+ * The summary mask proc_pending is the OR of the two and is what the lockless
+ * return-to-user fast path reads. Writers under sig_lock keep it in sync.
+ * Consumers (signal_claim_proc_pending_locked, signal_deliver) take exactly
+ * one source at a time so a plain pending instance cannot be silently dropped
+ * when a queued instance for the same signo is consumed first.
  */
 struct signal_state {
     struct sigaction_entry actions[SIG_MAX];
     u32 proc_pending;
+    u32 proc_pending_plain;
+    struct signal_value_queue queued[SIG_MAX];
 };
 
 #define PROC_MAX 16

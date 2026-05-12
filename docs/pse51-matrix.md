@@ -18,16 +18,10 @@ PSE51 interfaces fare on top of that base.
 Mazu's PSE51-oriented userspace ABI is feature-complete: every
 mandatory PSE51 syscall is wired and exercised by selftests.
 
-Two narrow gaps remain that are not blocking and have reasonable
+One narrow gap remains that is not blocking and has reasonable
 default behavior today:
 
-1. **`sigqueue` per-signal value payload**. Mazu signals are
-   level-style: a single bit per signal. The wait-for-signal API
-   (`SYS_SIGSUSPEND`, `SYS_SIGTIMEDWAIT`) is wired and `sysconf`
-   reports `_POSIX_REALTIME_SIGNALS = 1` (subset), but
-   `sigqueue` with a payload value is not implemented. Closing
-   this gap requires a bounded per-signal queue subsystem.
-2. **`pthread_attr_*` libc family**. Strictly a libc-side
+1. **`pthread_attr_*` libc family**. Strictly a libc-side
    concern. The kernel ABI accepts the resolved (entry, arg,
    prio) tuple and exposes per-thread `setschedparam` /
    `getschedparam`; once a PSE51 libc lands it can synthesize
@@ -59,7 +53,8 @@ libc attr family are out of scope for the kernel layer.
 ## What Mazu ships today (PSE51-relevant)
 
 The following PSE51 services are present and exercised by selftests
-(`tests/tests-pse51.c`, `tests/tests-syscall.c`,
+(`tests/tests-pse51.c` as the consolidated profile suite, with
+subsystem regression detail in `tests/tests-syscall.c`,
 `tests/tests-mqueue.c`, `tests/tests-posix_timer.c`,
 `tests/tests-rwlock.c`, `tests/tests-barrier.c`,
 `tests/tests-condvar.c`, `tests/tests-semaphore.c`,
@@ -144,8 +139,8 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | `pthread_sigmask` | `SYS_PTHREAD_SIGMASK` | implemented | Same wire shape as `SYS_SIGPROCMASK`; both operate on the calling thread's `td_sig.blocked`. Distinct syscall numbers so libc can keep `pthread_sigmask` and `sigprocmask` as separate ABI surfaces. |
 | `pthread_kill` | `SYS_PTHREAD_KILL` | implemented | Thread-directed signal: bit lands on the named thread's `td_sig.pending` rather than the per-proc `proc_pending` mask. Takes a `CAP_TYPE_THREAD` handle. SIGKILL rejected with EINVAL (must be process-wide). |
 | `sigsuspend` | `SYS_SIGSUSPEND` | implemented | Replace blocked mask with the supplied set, yield-loop until a deliverable signal arrives, restore prior mask, return EINTR. |
-| `sigtimedwait` / `sigwait` / `sigwaitinfo` | `SYS_SIGTIMEDWAIT` | implemented-with-mazu-abi | Block until any signal in the supplied set is pending; dequeue without invoking the handler; return signo. Honors `struct timespec *` timeout (NULL = wait forever; expired = EAGAIN). |
-| `sigqueue` value delivery | (none) | stubbed | Mazu signals are level-style: a single bit per signal in `pending`, no per-signal value queue. The wait API set above advertises `_POSIX_REALTIME_SIGNALS = 1` (subset) but `sigqueue` with a payload value requires an additional bounded queue subsystem. |
+| `sigtimedwait` / `sigwait` / `sigwaitinfo` | `SYS_SIGTIMEDWAIT` | implemented-with-mazu-abi | Block until any signal in the supplied set is pending; dequeue without invoking the handler; return signo. Honors `struct timespec *` timeout (NULL = wait forever; expired = EAGAIN). Mazu ABI also accepts an optional payload-out pointer in `a3`; queued `sigqueue` values are surfaced there when present. |
+| `sigqueue` value delivery | `SYS_SIGQUEUE` | implemented-with-mazu-abi | Process-directed queued values use a bounded per-signal ring (`SIGQUEUE_MAX_PER_SIGNO` entries per signo, with one extra internal slot reserved so a single in-flight `SYS_SIGTIMEDWAIT` consumer can losslessly roll back a dequeued payload if `copy_to_user` faults after the lock was dropped). Lossless rollback is guaranteed for the single-consumer case; if multiple threads simultaneously fault their rollbacks for the same signo, the helper drops one payload as defense-in-depth and surfaces a plain pending instance so the signal stays observable. Plain `kill` remains level-style and is tracked on a separate `proc_pending_plain` mask so it cannot be silently swallowed by a queued instance of the same signo. Queued payloads are observable via `SYS_SIGTIMEDWAIT` and friends, while one-argument signal handlers still receive only signo. |
 | `sigprocmask` (single-threaded) | `SYS_SIGPROCMASK` | implemented | Modify-and-return-old of the calling thread's `td_sig.blocked` under `sig_lock`. SIGKILL cannot be blocked. The mask migrated from per-process to per-thread when `SYS_PTHREAD_SIGMASK` landed; both syscalls now share the same backing field with distinct wire shapes so libc can keep them as separate ABI surfaces. |
 | `raise` | (libc) | not-applicable | Library-level wrapper for `kill(getpid(), sig)`; covered by `SYS_KILL`. |
 
@@ -249,7 +244,7 @@ feature-test value when implemented, or `-1` when absent):
 | `_SC_THREAD_PRIORITY_INHERIT` | `_POSIX_THREAD_PRIO_INHERIT` (200809L) | PI mutex is the only mutex flavor. |
 | `_SC_MESSAGE_PASSING` | `_POSIX_MESSAGE_PASSING` (1) | Anonymous queues only. |
 | `_SC_SPIN_LOCKS` | -1 | No userspace `pthread_spin_*` surface today, so the macro is intentionally not defined. |
-| `_SC_REALTIME_SIGNALS` | `_POSIX_REALTIME_SIGNALS` (1) | Wait-for-signal API present (sigsuspend / sigtimedwait); per-signal value queue (sigqueue) not implemented. |
+| `_SC_REALTIME_SIGNALS` | `_POSIX_REALTIME_SIGNALS` (1) | Wait-for-signal API is present. Bounded `sigqueue` payload delivery exists, but via a Mazu-specific extension rather than the full POSIX `siginfo_t` / `SA_SIGINFO` contract. |
 | `_SC_THREADS` | `_POSIX_THREADS` (1) | `SYS_THREAD_*` present; `PROC_THREAD_MAX = 4`. |
 | `_SC_THREAD_CPUTIME` | `_POSIX_THREAD_CPUTIME` (200809L) | `clock_gettime(CLOCK_THREAD_CPUTIME_ID, ...)` measures the calling thread's accumulated CPU time. |
 | `_SC_CPUTIME` | `_POSIX_CPUTIME` (200809L) | `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ...)` returns the sum across all live threads in the calling process. |
@@ -277,7 +272,6 @@ The bounded multi-threaded process model is in place: per-thread
 state migration (signal pending/blocked, signal-frame chain, robust
 futex list, errno TLS) and the user-visible pthread surface
 (`SYS_THREAD_CREATE` and friends) have both landed, with
-`PROC_THREAD_MAX = 4`. The two remaining gaps are the `sigqueue` payload
-queue (requires a bounded per-signal queue subsystem) and the
-`pthread_attr_*` libc family (strictly a libc-side concern; the
-kernel ABI already accepts the resolved (entry, arg, prio) tuple).
+`PROC_THREAD_MAX = 4`. The remaining gap is the `pthread_attr_*`
+libc family (strictly a libc-side concern; the kernel ABI already
+accepts the resolved (entry, arg, prio) tuple).

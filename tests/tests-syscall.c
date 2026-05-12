@@ -7,31 +7,7 @@
 #include <mazu/uaccess.h>
 #include <mazu/vfs.h>
 #include "../kernel/sync/futex.h"
-
-static struct proc *alloc_running_proc(void)
-{
-    struct proc *p = proc_alloc();
-    if (p)
-        proc_set_state(p, PROC_STATE_RUNNING);
-    return p;
-}
-
-static struct sched_task *alloc_mock_task(void)
-{
-    struct option_byte_array td_mem =
-        kvalloc_alloc(sizeof(struct sched_task), alignof(struct sched_task));
-    if (td_mem.is_none)
-        return NULL;
-    struct sched_task *td = byte_array_ptr(option_byte_array_checked(td_mem));
-    memset(td, 0, sizeof(*td));
-    td->td_cap_slot = -1;
-    return td;
-}
-
-static void free_mock_task(struct sched_task *td)
-{
-    kvalloc_free(byte_array_new((byte *) td, sizeof(*td)));
-}
+#include "tests-proc-helpers.h"
 
 static bool syscall_test_vfs_available(void)
 {
@@ -41,96 +17,6 @@ static bool syscall_test_vfs_available(void)
     struct vfs_file vf = result_vfs_file_checked(f);
     vfs_close(&vf);
     return true;
-}
-
-static inline i32 syscall_test_thread_cap_slot(u8 task_slot)
-{
-    return CAP_SPACE_SLOTS - PROC_THREAD_MAX + (i32) task_slot;
-}
-
-static i64 syscall_test_thread_token(struct proc *p, struct sched_task *td)
-{
-    assert(p);
-    assert(td);
-    assert(td->td_cap_slot >= 0);
-    return cap_get_token(p, td->td_cap_slot, CAP_TYPE_THREAD);
-}
-
-/* Allocate a RUNNING proc + mock task, linked together. */
-static bool alloc_proc_and_task(struct proc **out_p, struct sched_task **out_td)
-{
-    struct proc *p = alloc_running_proc();
-    if (!p)
-        return false;
-    struct sched_task *td = alloc_mock_task();
-    if (!td) {
-        proc_set_state(p, PROC_STATE_ZOMBIE);
-        proc_free(p);
-        return false;
-    }
-    td->proc = p;
-    {
-        u64 pflags = proc_table_lock_irqsave();
-        bool ok = proc_attach_task(p, td);
-        proc_table_unlock_irqrestore(pflags);
-        if (!ok) {
-            free_mock_task(td);
-            proc_set_state(p, PROC_STATE_ZOMBIE);
-            proc_free(p);
-            return false;
-        }
-    }
-    u8 thread_slot = proc_task_slot(p, td);
-    i32 thread_handle = cap_open_handle(
-        p, thread_slot, CAP_TYPE_THREAD, CAP_RIGHT_READ | CAP_RIGHT_WRITE,
-        syscall_test_thread_cap_slot(thread_slot), true);
-    if (thread_handle < 0) {
-        u64 pflags = proc_table_lock_irqsave();
-        (void) proc_reap_exited_thread_locked(p, td);
-        proc_table_unlock_irqrestore(pflags);
-        free_mock_task(td);
-        proc_set_state(p, PROC_STATE_ZOMBIE);
-        proc_free(p);
-        return false;
-    }
-    td->td_cap_slot = (i16) thread_handle;
-    *out_p = p;
-    *out_td = td;
-    return true;
-}
-
-/* Teardown: transition to ZOMBIE, free proc, free task. */
-static void free_proc_and_task(struct proc *p, struct sched_task *td)
-{
-    proc_set_state(p, PROC_STATE_ZOMBIE);
-    proc_free(p);
-    free_mock_task(td);
-}
-
-static bool attach_mock_thread(struct proc *p, struct sched_task *target)
-{
-    u8 slot = PROC_THREAD_MAX;
-    u64 flags = proc_table_lock_irqsave();
-    bool ok = proc_reserve_thread_slot(p, &slot);
-    proc_table_unlock_irqrestore(flags);
-    if (!ok)
-        return false;
-    flags = proc_table_lock_irqsave();
-    ok = proc_attach_task_slot(p, target, slot);
-    proc_table_unlock_irqrestore(flags);
-    if (!ok)
-        return false;
-    i32 thread_handle = cap_open_handle(
-        p, slot, CAP_TYPE_THREAD, CAP_RIGHT_READ | CAP_RIGHT_WRITE,
-        syscall_test_thread_cap_slot(slot), true);
-    if (thread_handle < 0) {
-        flags = proc_table_lock_irqsave();
-        (void) proc_reap_exited_thread_locked(p, target);
-        proc_table_unlock_irqrestore(flags);
-        return false;
-    }
-    target->td_cap_slot = (i16) thread_handle;
-    return ok;
 }
 
 static i32 selftest_sys_open_emfile(void)
@@ -1558,6 +1444,7 @@ static i32 selftest_sigtimedwait(void)
     tf.a0 = (u64) va;
     tf.a1 = 0;
     tf.a2 = 0;
+    tf.a3 = 0;
     assert(syscall_dispatch(&tf, td) == -(i64) EINVAL);
 
     /* Pre-pend a signal in the per-thread mask, then sigtimedwait
@@ -1569,6 +1456,7 @@ static i32 selftest_sigtimedwait(void)
     tf.a0 = (u64) va;
     tf.a1 = (u64) (va + sizeof(u32));
     tf.a2 = 0;
+    tf.a3 = 0;
     i64 ret = syscall_dispatch(&tf, td);
     assert(ret == SIGUSR2);
     assert((td->td_sig.pending & sig_bit(SIGUSR2)) == 0);
@@ -1581,3 +1469,397 @@ static i32 selftest_sigtimedwait(void)
     return 0;
 }
 DEFINE_SELFTEST(sigtimedwait, selftest_sigtimedwait);
+
+static i32 selftest_sigqueue_payload(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (136UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR1;
+    tf.a2 = 0x1122334455667788ULL;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) != 0);
+
+    u32 set = sig_bit(SIGUSR1);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+
+    tf.a7 = SYS_SIGTIMEDWAIT;
+    tf.a0 = (u64) va;
+    tf.a1 = (u64) (va + sizeof(u32));
+    tf.a2 = 0;
+    tf.a3 = (u64) (va + sizeof(u32) + sizeof(i32));
+    assert(syscall_dispatch(&tf, td) == SIGUSR1);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) == 0);
+    assert(p->sig_state.queued[SIGUSR1].count == 0);
+
+    i32 signo_out;
+    u64 value_out;
+    assert(copy_from_user(&signo_out, va + sizeof(u32), sizeof(signo_out)) ==
+           0);
+    assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                          sizeof(value_out)) == 0);
+    assert(signo_out == SIGUSR1);
+    assert(value_out == 0x1122334455667788ULL);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_payload, selftest_sigqueue_payload);
+
+static i32 selftest_sigqueue_full(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR2;
+
+    for (u64 i = 0; i < SIGQUEUE_MAX_PER_SIGNO; i++) {
+        tf.a2 = i + 1;
+        assert(syscall_dispatch(&tf, td) == 0);
+    }
+
+    tf.a2 = 99;
+    assert(syscall_dispatch(&tf, td) == -(i64) EAGAIN);
+    assert(p->sig_state.queued[SIGUSR2].count == SIGQUEUE_MAX_PER_SIGNO);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_full, selftest_sigqueue_full);
+
+/* FIFO order across multiple queued sigqueue payloads: dequeues must
+ * return values in the order they were posted.
+ */
+static i32 selftest_sigqueue_fifo(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (137UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR1;
+    for (u64 i = 0; i < SIGQUEUE_MAX_PER_SIGNO; i++) {
+        tf.a2 = 0x100 + i;
+        assert(syscall_dispatch(&tf, td) == 0);
+    }
+    assert(p->sig_state.queued[SIGUSR1].count == SIGQUEUE_MAX_PER_SIGNO);
+
+    u32 set = sig_bit(SIGUSR1);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+
+    for (u64 i = 0; i < SIGQUEUE_MAX_PER_SIGNO; i++) {
+        tf.a7 = SYS_SIGTIMEDWAIT;
+        tf.a0 = (u64) va;
+        tf.a1 = (u64) (va + sizeof(u32));
+        tf.a2 = 0;
+        tf.a3 = (u64) (va + sizeof(u32) + sizeof(i32));
+        assert(syscall_dispatch(&tf, td) == SIGUSR1);
+        u64 value_out;
+        assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                              sizeof(value_out)) == 0);
+        assert(value_out == 0x100 + i);
+    }
+    assert(p->sig_state.queued[SIGUSR1].count == 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) == 0);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR1)) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_fifo, selftest_sigqueue_fifo);
+
+/* kill() followed by sigqueue() on the same signo: consuming the queued
+ * payload must not silently clear the plain pending instance. The receiver
+ * dequeues the sigqueue payload first (FIFO), then the plain kill instance
+ * with no payload.
+ */
+static i32 selftest_sigqueue_then_kill_coexist(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (138UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    /* First: plain kill(). */
+    tf.a7 = SYS_KILL;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR2;
+    assert(syscall_dispatch(&tf, td) == 0);
+    /* Then: sigqueue() with payload. */
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR2;
+    tf.a2 = 0xdeadbeefULL;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR2)) != 0);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR2)) != 0);
+    assert(p->sig_state.queued[SIGUSR2].count == 1);
+
+    /* First dequeue: sigqueue payload. */
+    u32 set = sig_bit(SIGUSR2);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    u64 sentinel = 0xa5a5a5a5a5a5a5a5ULL;
+    assert(copy_to_user(va + sizeof(u32) + sizeof(i32), &sentinel,
+                        sizeof(sentinel)) == 0);
+    tf.a7 = SYS_SIGTIMEDWAIT;
+    tf.a0 = (u64) va;
+    tf.a1 = (u64) (va + sizeof(u32));
+    tf.a2 = 0;
+    tf.a3 = (u64) (va + sizeof(u32) + sizeof(i32));
+    assert(syscall_dispatch(&tf, td) == SIGUSR2);
+    u64 value_out;
+    assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                          sizeof(value_out)) == 0);
+    assert(value_out == 0xdeadbeefULL);
+    /* Plain instance must still be pending after consuming the queued one. */
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR2)) != 0);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR2)) != 0);
+    assert(p->sig_state.queued[SIGUSR2].count == 0);
+
+    /* Second dequeue: plain kill instance, payload untouched. */
+    assert(copy_to_user(va + sizeof(u32) + sizeof(i32), &sentinel,
+                        sizeof(sentinel)) == 0);
+    assert(syscall_dispatch(&tf, td) == SIGUSR2);
+    assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                          sizeof(value_out)) == 0);
+    assert(value_out == sentinel);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR2)) == 0);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR2)) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_then_kill_coexist,
+                selftest_sigqueue_then_kill_coexist);
+
+/* sigqueue() followed by kill() on the same signo: same invariant in
+ * reverse arrival order. The queued payload still comes out first.
+ */
+static i32 selftest_kill_then_sigqueue_coexist(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (139UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR1;
+    tf.a2 = 0xcafebabeULL;
+    assert(syscall_dispatch(&tf, td) == 0);
+    tf.a7 = SYS_KILL;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR1;
+    assert(syscall_dispatch(&tf, td) == 0);
+    assert(p->sig_state.queued[SIGUSR1].count == 1);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR1)) != 0);
+
+    u32 set = sig_bit(SIGUSR1);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a7 = SYS_SIGTIMEDWAIT;
+    tf.a0 = (u64) va;
+    tf.a1 = (u64) (va + sizeof(u32));
+    tf.a2 = 0;
+    tf.a3 = (u64) (va + sizeof(u32) + sizeof(i32));
+    assert(syscall_dispatch(&tf, td) == SIGUSR1);
+    u64 value_out;
+    assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                          sizeof(value_out)) == 0);
+    assert(value_out == 0xcafebabeULL);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR1)) != 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) != 0);
+
+    /* Drain the plain instance. */
+    assert(syscall_dispatch(&tf, td) == SIGUSR1);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(kill_then_sigqueue_coexist,
+                selftest_kill_then_sigqueue_coexist);
+
+/* Realistic concurrent-producer rollback: queue is full at the producer cap,
+ * a consumer dequeues the head, a producer immediately refills the vacated
+ * slot, then the consumer's copy_to_user faults and triggers rollback. The
+ * reserved internal slot must let the rollback succeed losslessly, restoring
+ * FIFO order (the originally-popped value comes out next).
+ */
+static i32 selftest_sigqueue_restore_lossless(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    u64 sflags = proc_sig_lock_irqsave(p);
+    /* Producer fills the queue to MAX. */
+    for (u64 i = 0; i < SIGQUEUE_MAX_PER_SIGNO; i++) {
+        p->sig_state.queued[SIGUSR1].values[i] = 0xb000 + i;
+    }
+    p->sig_state.queued[SIGUSR1].head = 0;
+    p->sig_state.queued[SIGUSR1].tail = SIGQUEUE_MAX_PER_SIGNO;
+    p->sig_state.queued[SIGUSR1].count = SIGQUEUE_MAX_PER_SIGNO;
+    p->sig_state.proc_pending |= sig_bit(SIGUSR1);
+
+    /* Consumer dequeues into a local. */
+    u64 popped;
+    bool had_value;
+    assert(signal_claim_proc_pending_locked(p, SIGUSR1, &popped, &had_value));
+    assert(had_value == true);
+    assert(popped == 0xb000);
+    assert(p->sig_state.queued[SIGUSR1].count == SIGQUEUE_MAX_PER_SIGNO - 1);
+    proc_sig_unlock_irqrestore(p, sflags);
+
+    /* Producer refills the slot we vacated. */
+    i32 rc = signal_queue_send(p, SIGUSR1, 0xb004);
+    assert(rc == 0);
+    assert(p->sig_state.queued[SIGUSR1].count == SIGQUEUE_MAX_PER_SIGNO);
+
+    /* Consumer faults during copy_to_user and rolls back. The reserved
+     * internal slot makes the push lossless.
+     */
+    sflags = proc_sig_lock_irqsave(p);
+    bool dropped = signal_restore_proc_pending_locked(p, SIGUSR1, popped, true);
+    assert(dropped == false);
+    assert(p->sig_state.queued[SIGUSR1].count == SIGQUEUE_MAX_PER_SIGNO + 1);
+
+    /* FIFO must place the restored value back at the head. */
+    u64 v;
+    bool h;
+    assert(signal_claim_proc_pending_locked(p, SIGUSR1, &v, &h));
+    assert(h == true && v == 0xb000);
+    proc_sig_unlock_irqrestore(p, sflags);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_restore_lossless, selftest_sigqueue_restore_lossless);
+
+/* Defense-in-depth: if the ring is somehow filled past the user-visible cap
+ * (pathological multi-consumer race), the rollback helper must still avoid
+ * corrupting q->count and must surface a plain pending instance so the
+ * signal stays observable. The payload is lost in this branch by design.
+ */
+static i32 selftest_sigqueue_restore_overflow(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    u64 sflags = proc_sig_lock_irqsave(p);
+    for (u64 i = 0; i < SIGQUEUE_RING_CAP; i++) {
+        p->sig_state.queued[SIGUSR1].values[i] = 0xa000 + i;
+    }
+    p->sig_state.queued[SIGUSR1].head = 0;
+    p->sig_state.queued[SIGUSR1].tail = 0;
+    p->sig_state.queued[SIGUSR1].count = SIGQUEUE_RING_CAP;
+    p->sig_state.proc_pending |= sig_bit(SIGUSR1);
+
+    bool dropped = signal_restore_proc_pending_locked(p, SIGUSR1, 0xdead, true);
+    proc_sig_unlock_irqrestore(p, sflags);
+
+    assert(dropped == true);
+    assert(p->sig_state.queued[SIGUSR1].count == SIGQUEUE_RING_CAP);
+    assert((p->sig_state.proc_pending_plain & sig_bit(SIGUSR1)) != 0);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) != 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_restore_overflow, selftest_sigqueue_restore_overflow);
+
+/* sigtimedwait pre-validation rejects an unwritable signo_out without
+ * consuming the queued payload, so a retry can observe it.
+ */
+static i32 selftest_sigtimedwait_efault_rollback(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (140UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_SIGQUEUE;
+    tf.a0 = p->pid;
+    tf.a1 = SIGUSR1;
+    tf.a2 = 0x42ULL;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    /* Pass an unmapped pointer for signo_out. Pre-validation in
+     * sys_sigtimedwait_h catches this before the bit is consumed, so the
+     * queue must still hold the payload.
+     */
+    u32 set = sig_bit(SIGUSR1);
+    assert(copy_to_user(va, &set, sizeof(set)) == 0);
+    tf.a7 = SYS_SIGTIMEDWAIT;
+    tf.a0 = (u64) va;
+    tf.a1 = (u64) 0xdeadc0deUL;
+    tf.a2 = 0;
+    tf.a3 = 0;
+    assert(syscall_dispatch(&tf, td) == -(i64) EFAULT);
+    assert(p->sig_state.queued[SIGUSR1].count == 1);
+    assert((p->sig_state.proc_pending & sig_bit(SIGUSR1)) != 0);
+    /* Retry with a valid pointer must observe the still-queued payload. */
+    tf.a1 = (u64) (va + sizeof(u32));
+    tf.a3 = (u64) (va + sizeof(u32) + sizeof(i32));
+    assert(syscall_dispatch(&tf, td) == SIGUSR1);
+    u64 value_out;
+    assert(copy_from_user(&value_out, va + sizeof(u32) + sizeof(i32),
+                          sizeof(value_out)) == 0);
+    assert(value_out == 0x42ULL);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sigtimedwait_efault_rollback,
+                selftest_sigtimedwait_efault_rollback);
+
+/* ABI stability check: SYS_SIGQUEUE is appended at the end of the table; the
+ * pre-existing trailing entries must keep their numbers.
+ */
+static i32 selftest_sigqueue_abi_numbering(void)
+{
+    static_assert(SYS_THREAD_CANCEL == 93, "SYS_THREAD_CANCEL must stay at 93");
+    static_assert(SYS_THREAD_SETCANCELSTATE == 94,
+                  "SYS_THREAD_SETCANCELSTATE must stay at 94");
+    static_assert(SYS_THREAD_TESTCANCEL == 95,
+                  "SYS_THREAD_TESTCANCEL must stay at 95");
+    static_assert(SYS_CAP_DROP == 96, "SYS_CAP_DROP must stay at 96");
+    static_assert(SYS_CAP_TRANSFER == 97, "SYS_CAP_TRANSFER must stay at 97");
+    static_assert(SYS_CAP_REVOKE_DELEGATE == 98,
+                  "SYS_CAP_REVOKE_DELEGATE must stay at 98");
+    static_assert(SYS_CAP_GET_TOKEN == 99, "SYS_CAP_GET_TOKEN must stay at 99");
+    static_assert(SYS_SIGQUEUE == 100, "SYS_SIGQUEUE must be appended at 100");
+    static_assert(SYS_NR == 101, "SYS_NR must stay at 101");
+    return 0;
+}
+DEFINE_SELFTEST(sigqueue_abi_numbering, selftest_sigqueue_abi_numbering);
