@@ -36,9 +36,10 @@
 #define _POSIX_THREAD_CPUTIME 200809L
 #define _POSIX_THREADS 1 /* SYS_THREAD_*; PROC_THREAD_MAX = 4 */
 /* _POSIX_REALTIME_SIGNALS reports the wait-for-signal API set
- * (sigsuspend, sigtimedwait, sigwait, sigwaitinfo). Mazu does not
- * yet implement the per-signal value queue (sigqueue), so this
- * advertises the subset value 1 rather than 200809L.
+ * (sigsuspend, sigtimedwait, sigwait, sigwaitinfo). Mazu also has a
+ * bounded sigqueue-style payload path, but it is exposed through a
+ * Mazu-specific ABI extension rather than the full POSIX siginfo /
+ * SA_SIGINFO surface, so this remains the subset value 1.
  */
 #define _POSIX_REALTIME_SIGNALS 1
 /* _POSIX_SPIN_LOCKS is intentionally not defined: there is no

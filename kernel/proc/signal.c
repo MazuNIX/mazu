@@ -2,7 +2,8 @@
 /* Signal delivery for PSE51.
  *
  * Signal delivery model:
- * - Signals are pending bits, not queued (standard POSIX behavior).
+ * - Plain kill-style signals are pending bits.
+ * - sigqueue-style process-directed payloads use a bounded per-signo queue.
  * - Delivery happens on trap exit (return-to-user path).
  * - Handler invocation: save current trap frame on the user stack,
  *   set up execution to jump to the handler, sys_sigreturn restores.
@@ -25,16 +26,89 @@ void signal_init(struct signal_state *ss)
      * task creation in sched_create_user_task; this initializer is
      * for the per-process disposition table only.
      */
+    ss->proc_pending = 0;
+    ss->proc_pending_plain = 0;
     for (i32 i = 0; i < SIG_MAX; i++) {
         ss->actions[i].handler = SIG_DFL;
         ss->actions[i].sa_mask = 0;
         ss->actions[i].sa_flags = 0;
+        ss->queued[i].head = 0;
+        ss->queued[i].tail = 0;
+        ss->queued[i].count = 0;
     }
 }
 
 static inline bool sig_valid(i32 signo)
 {
     return signo > 0 && signo < SIG_MAX;
+}
+
+static bool signal_value_queue_push_locked(struct signal_state *ss,
+                                           i32 signo,
+                                           u64 value)
+{
+    struct signal_value_queue *q = &ss->queued[signo];
+
+    /* Producers cap at the user-visible limit; the +1 internal slot is
+     * reserved for the rollback-after-fault path below.
+     */
+    if (q->count >= SIGQUEUE_MAX_PER_SIGNO)
+        return false;
+    q->values[q->tail] = value;
+    q->tail = (u8) ((q->tail + 1) % SIGQUEUE_RING_CAP);
+    q->count++;
+    return true;
+}
+
+static bool signal_value_queue_pop_locked(struct signal_state *ss,
+                                          i32 signo,
+                                          u64 *out_value)
+{
+    struct signal_value_queue *q = &ss->queued[signo];
+
+    if (q->count == 0)
+        return false;
+    if (out_value)
+        *out_value = q->values[q->head];
+    q->head = (u8) ((q->head + 1) % SIGQUEUE_RING_CAP);
+    q->count--;
+    return true;
+}
+
+/* Push a payload back at the queue head (LIFO insert used only to undo a
+ * previous pop). Always succeeds for a single in-flight consumer because the
+ * ring is sized SIGQUEUE_MAX_PER_SIGNO + 1 (the producer cap leaves one slot
+ * unused for exactly this case). Returns false only on the pathological case
+ * where multiple consumers race their rollbacks past the reserved slot.
+ */
+static bool signal_value_queue_push_head_locked(struct signal_state *ss,
+                                                i32 signo,
+                                                u64 value)
+{
+    struct signal_value_queue *q = &ss->queued[signo];
+
+    if (q->count >= SIGQUEUE_RING_CAP)
+        return false;
+    q->head = (u8) ((q->head + SIGQUEUE_RING_CAP - 1) % SIGQUEUE_RING_CAP);
+    q->values[q->head] = value;
+    q->count++;
+    return true;
+}
+
+/* Refresh the summary proc_pending bit for signo from the underlying state.
+ * Caller must hold p->sig_lock. The atomic ensures the lockless fast-path
+ * reader (signal_has_deliverable) sees a coherent value.
+ */
+static inline void sig_refresh_proc_pending_locked(struct signal_state *ss,
+                                                   i32 signo)
+{
+    bool any = (ss->proc_pending_plain & sig_bit(signo)) ||
+               ss->queued[signo].count > 0;
+    if (any)
+        __atomic_or_fetch(&ss->proc_pending, sig_bit(signo), __ATOMIC_RELAXED);
+    else
+        __atomic_and_fetch(&ss->proc_pending, ~sig_bit(signo),
+                           __ATOMIC_RELAXED);
 }
 
 static inline bool signal_restore_tf_valid(struct proc *p,
@@ -64,7 +138,7 @@ static inline void signal_restore_tf(struct trap_frame *dst,
  * a newly posted signal at the earliest opportunity.
  *
  * TD_STATE_SLEEPING (nanosleep): sched_wake_sleeping cancels the sleep
- * callout, removes from sleep_list, and enqueues as READY — all under
+ * callout, removes from sleep_list, and enqueues as READY, all under
  * sched_lock, which serializes against the normal sleep callout wake.
  *
  * TD_STATE_BLOCKED / TD_STATE_SEM_WAIT (sync primitives): we cannot
@@ -167,8 +241,8 @@ i32 signal_send(struct proc *p, i32 signo)
     u64 tflags = proc_table_lock_irqsave();
     if (p->state != PROC_STATE_FREE && p->state != PROC_STATE_ZOMBIE) {
         u64 sflags = proc_sig_lock_irqsave(p);
-        __atomic_or_fetch(&p->sig_state.proc_pending, sig_bit(signo),
-                          __ATOMIC_RELAXED);
+        p->sig_state.proc_pending_plain |= sig_bit(signo);
+        sig_refresh_proc_pending_locked(&p->sig_state, signo);
         proc_sig_unlock_irqrestore(p, sflags);
         delivered = true;
         if (signo == SIGKILL)
@@ -189,6 +263,97 @@ i32 signal_send(struct proc *p, i32 signo)
         return 0;
     }
     return 0;
+}
+
+i32 signal_queue_send(struct proc *p, i32 signo, u64 value)
+{
+    if (!p || !sig_valid(signo))
+        return -(i32) EINVAL;
+
+    bool need_kill = false;
+    bool delivered = false;
+    i32 rc = 0;
+
+    u64 tflags = proc_table_lock_irqsave();
+    if (p->state != PROC_STATE_FREE && p->state != PROC_STATE_ZOMBIE) {
+        u64 sflags = proc_sig_lock_irqsave(p);
+        if (!signal_value_queue_push_locked(&p->sig_state, signo, value))
+            rc = -(i32) EAGAIN;
+        else {
+            sig_refresh_proc_pending_locked(&p->sig_state, signo);
+            delivered = true;
+            if (signo == SIGKILL)
+                need_kill = true;
+            else
+                signal_interrupt_task(signal_pick_wake_target_locked(p, signo));
+        }
+        proc_sig_unlock_irqrestore(p, sflags);
+    }
+    proc_table_unlock_irqrestore(tflags);
+
+    if (rc < 0)
+        return rc;
+    if (!delivered)
+        return 0;
+
+    if (need_kill) {
+        proc_exit(p, -SIGKILL);
+        return 0;
+    }
+    return 0;
+}
+
+bool signal_claim_proc_pending_locked(struct proc *p,
+                                      i32 signo,
+                                      u64 *out_value,
+                                      bool *out_has_value)
+{
+    if (!p || !sig_valid(signo) ||
+        (p->sig_state.proc_pending & sig_bit(signo)) == 0)
+        return false;
+
+    /* Prefer a queued sigqueue payload (FIFO). If none is queued but a plain
+     * kill-style instance is still pending, consume that instead. Each call
+     * consumes exactly one source so kill() and sigqueue() of the same signo
+     * can coexist without one silently swallowing the other.
+     */
+    bool had_value =
+        signal_value_queue_pop_locked(&p->sig_state, signo, out_value);
+    if (!had_value && (p->sig_state.proc_pending_plain & sig_bit(signo))) {
+        p->sig_state.proc_pending_plain &= ~sig_bit(signo);
+    }
+    if (out_has_value)
+        *out_has_value = had_value;
+
+    sig_refresh_proc_pending_locked(&p->sig_state, signo);
+    return true;
+}
+
+bool signal_restore_proc_pending_locked(struct proc *p,
+                                        i32 signo,
+                                        u64 value,
+                                        bool had_value)
+{
+    if (!p || !sig_valid(signo))
+        return false;
+
+    bool payload_dropped = false;
+    if (had_value) {
+        if (!signal_value_queue_push_head_locked(&p->sig_state, signo, value)) {
+            /* Queue filled up via a concurrent sigqueue after the pop. The
+             * exact payload is lost, but a same-signo instance is still in
+             * flight via the queue, so observability of the signal is not
+             * lost. Surface a plain pending instance as well so the receiver
+             * is guaranteed to retry.
+             */
+            p->sig_state.proc_pending_plain |= sig_bit(signo);
+            payload_dropped = true;
+        }
+    } else {
+        p->sig_state.proc_pending_plain |= sig_bit(signo);
+    }
+    sig_refresh_proc_pending_locked(&p->sig_state, signo);
+    return payload_dropped;
 }
 
 /* Saved signal context pushed onto the user stack. */
@@ -260,7 +425,7 @@ bool signal_deliver(struct sched_task *td, struct trap_frame *tf)
     if (thread_pending & sig_bit(signo))
         td->td_sig.pending &= ~sig_bit(signo);
     else
-        p->sig_state.proc_pending &= ~sig_bit(signo);
+        (void) signal_claim_proc_pending_locked(p, signo, NULL, NULL);
     sig_handler_fn_t handler = p->sig_state.actions[signo].handler;
 
     if (handler == SIG_IGN) {

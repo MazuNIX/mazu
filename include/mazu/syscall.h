@@ -188,7 +188,13 @@
 #define SYS_CAP_REVOKE_DELEGATE 98
 #define SYS_CAP_GET_TOKEN 99
 
-#define SYS_NR 100 /* total number of syscalls */
+/* PSE51 sigqueue(): queued process-directed signal with payload. Appended at
+ * the end of the syscall table so the rest of the numbering stays stable across
+ * this branch.
+ */
+#define SYS_SIGQUEUE 100
+
+#define SYS_NR 101 /* total number of syscalls */
 
 /* pthread_setcancelstate state values. */
 #define PTHREAD_CANCEL_ENABLE 0

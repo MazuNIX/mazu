@@ -2216,6 +2216,22 @@ static i64 sys_kill_h(struct trap_frame *tf, struct sched_task *td __unused)
     return (i64) signal_send(target, signo);
 }
 
+static i64 sys_sigqueue_h(struct trap_frame *tf, struct sched_task *td __unused)
+{
+    u16 pid = (u16) tf->a0;
+    i32 signo = (i32) tf->a1;
+    u64 value = tf->a2;
+
+    struct proc *target = proc_find(pid);
+    if (!target)
+        return -(i64) ESRCH;
+
+    if (signo == 0)
+        return 0;
+
+    return (i64) signal_queue_send(target, signo, value);
+}
+
 /* Forward declaration; defined alongside the other thread syscalls
  * later in the file.
  */
@@ -2340,14 +2356,17 @@ static i64 sys_sigsuspend_h(struct trap_frame *tf, struct sched_task *td)
     return -(i64) EINTR;
 }
 
-/* sigtimedwait(set, info, timeout):
+/* sigtimedwait(set, info, timeout, value_out):
  *   block until any signal in *set becomes pending; on success,
  *   atomically dequeue that signal (without invoking its handler) and
- *   write its number to *info (just the signo, since Mazu signals
- *   carry no siginfo payload). Returns the signal number on success,
- *   or -EAGAIN on timeout, -EINTR if a non-set signal arrives.
+ *   write its number to *info. If a queued sigqueue payload exists for
+ *   that signo, the kernel writes it to *value_out. Plain kill-style
+ *   signals report no payload and leave *value_out unmodified.
+ *   Returns the signal number on success, or -EAGAIN on timeout,
+ *   -EINTR if a non-set signal arrives.
  *   a0 = user *u32 set, a1 = user *i32 signo_out (NULL ok),
- *   a2 = user *struct timespec timeout (NULL = wait forever).
+ *   a2 = user *struct timespec timeout (NULL = wait forever),
+ *   a3 = user *u64 value_out (NULL ok).
  */
 static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
 {
@@ -2356,6 +2375,7 @@ static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
     ptr u_set = (ptr) tf->a0;
     ptr u_signo_out = (ptr) tf->a1;
     ptr u_timeout = (ptr) tf->a2;
+    ptr u_value_out = (ptr) tf->a3;
 
     if (!u_set)
         return -(i64) EFAULT;
@@ -2374,6 +2394,8 @@ static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
      * delivered to a handler.
      */
     if (u_signo_out && !user_addr_writable(u_signo_out, sizeof(i32)))
+        return -(i64) EFAULT;
+    if (u_value_out && !user_addr_writable(u_value_out, sizeof(u64)))
         return -(i64) EFAULT;
 
     /* Compute a monotonic deadline once. NULL timeout = no deadline.
@@ -2428,6 +2450,9 @@ static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
 
     i64 result = 0;
     i32 dequeued_signo = 0;
+    u64 dequeued_value = 0;
+    bool dequeued_has_value = false;
+    bool dequeued_from_proc = false;
     for (;;) {
         sflags = proc_sig_lock_irqsave(p);
         u32 thread_pending = td->td_sig.pending;
@@ -2443,8 +2468,13 @@ static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
             }
             if (thread_pending & sig_bit(signo))
                 td->td_sig.pending &= ~sig_bit(signo);
-            else
-                p->sig_state.proc_pending &= ~sig_bit(signo);
+            else if (!signal_claim_proc_pending_locked(
+                         p, signo, &dequeued_value, &dequeued_has_value)) {
+                td->td_sig.sigwait_set = 0;
+                proc_sig_unlock_irqrestore(p, sflags);
+                continue;
+            } else
+                dequeued_from_proc = true;
             td->td_sig.sigwait_set = 0;
             proc_sig_unlock_irqrestore(p, sflags);
             dequeued_signo = signo;
@@ -2486,19 +2516,37 @@ static i64 sys_sigtimedwait_h(struct trap_frame *tf, struct sched_task *td)
 
     /* Write the signo out-of-line. u_signo_out was pre-validated so
      * a fault here is unlikely; if it does fault (concurrent munmap
-     * after validation), re-queue the bit so the caller can retry.
+     * after validation), restore the pending instance so the caller can
+     * retry. signal_restore_proc_pending_locked re-checks queue capacity
+     * under sig_lock, since a concurrent sigqueue may have arrived after
+     * the original pop and filled the queue.
      */
     if (u_signo_out) {
         i64 cprc =
             copy_to_user(u_signo_out, &dequeued_signo, sizeof(dequeued_signo));
         if (cprc < 0) {
             sflags = proc_sig_lock_irqsave(p);
-            /* Restore on the per-thread mask (a thread-directed
-             * deliver was either consumed here or was process-wide
-             * and is best preserved per-thread to avoid a feedback
-             * loop with signal_pick_wake_target).
-             */
-            td->td_sig.pending |= sig_bit(dequeued_signo);
+            if (dequeued_from_proc) {
+                (void) signal_restore_proc_pending_locked(
+                    p, dequeued_signo, dequeued_value, dequeued_has_value);
+            } else {
+                td->td_sig.pending |= sig_bit(dequeued_signo);
+            }
+            proc_sig_unlock_irqrestore(p, sflags);
+            return cprc;
+        }
+    }
+    if (u_value_out && dequeued_has_value) {
+        i64 cprc =
+            copy_to_user(u_value_out, &dequeued_value, sizeof(dequeued_value));
+        if (cprc < 0) {
+            sflags = proc_sig_lock_irqsave(p);
+            if (dequeued_from_proc) {
+                (void) signal_restore_proc_pending_locked(
+                    p, dequeued_signo, dequeued_value, dequeued_has_value);
+            } else {
+                td->td_sig.pending |= sig_bit(dequeued_signo);
+            }
             proc_sig_unlock_irqrestore(p, sflags);
             return cprc;
         }
@@ -3309,6 +3357,7 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_PTHREAD_SIGMASK] = {sys_pthread_sigmask_h, SYSCALL_F_NEEDS_PROC},
     [SYS_SIGSUSPEND] = {sys_sigsuspend_h, SYSCALL_F_NEEDS_PROC},
     [SYS_SIGTIMEDWAIT] = {sys_sigtimedwait_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_SIGQUEUE] = {sys_sigqueue_h, 0},
     [SYS_THREAD_CANCEL] = {sys_thread_cancel_h, SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_SETCANCELSTATE] = {sys_thread_setcancelstate_h,
                                    SYSCALL_F_NEEDS_PROC},

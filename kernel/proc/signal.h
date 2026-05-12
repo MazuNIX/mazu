@@ -56,6 +56,41 @@ void signal_init(struct signal_state *ss);
  */
 i32 signal_send(struct proc *p, i32 signo);
 
+/* Enqueue a process-directed signal with a queued payload value.
+ * Repeated deliveries of the same signo are preserved up to the
+ * bounded per-signal queue depth. Returns -EAGAIN if that queue is
+ * full.
+ */
+i32 signal_queue_send(struct proc *p, i32 signo, u64 value);
+
+/* Claim one process-directed pending instance of signo. Caller must
+ * hold p->sig_lock. Queued sigqueue payloads are preferred (FIFO); when
+ * one is dequeued, *out_value receives the payload and *out_has_value is
+ * set true. When no payload is queued but a plain kill-style instance is
+ * pending, that instance is consumed and *out_has_value is set false.
+ * The summary proc_pending bit is updated to reflect any remaining source.
+ * Returns false if no instance of signo is pending.
+ */
+bool signal_claim_proc_pending_locked(struct proc *p,
+                                      i32 signo,
+                                      u64 *out_value,
+                                      bool *out_has_value);
+
+/* Re-insert a previously-claimed process-directed instance after a partial
+ * delivery failure (e.g. sigtimedwait copy_to_user fault after the signal
+ * was already dequeued). Caller must hold p->sig_lock. If had_value is true,
+ * the payload is pushed back at the queue head; if the queue is now full
+ * (because a concurrent sigqueue arrived after the original pop), the
+ * payload is dropped and a plain pending instance is recorded instead so the
+ * signal itself stays observable. If had_value is false, a plain pending
+ * instance is restored. The summary proc_pending bit is refreshed.
+ * Returns true if a payload had to be dropped because the queue was full.
+ */
+bool signal_restore_proc_pending_locked(struct proc *p,
+                                        i32 signo,
+                                        u64 value,
+                                        bool had_value);
+
 /* Return true if this specific thread can take signo immediately. */
 static inline bool signal_thread_can_deliver(const struct sched_task *td,
                                              i32 signo)
