@@ -12,6 +12,7 @@
  */
 
 #include <mazu/assert.h>
+#include <mazu/cap.h>
 #include <mazu/eventlog.h>
 #include <mazu/ipi.h>
 #include <mazu/klog.h>
@@ -76,16 +77,6 @@ static inline bool validate_fd_number(i32 fd)
     return fd >= 0 && fd < PROC_FD_MAX;
 }
 
-static i32 find_free_fd_locked(struct proc *p)
-{
-    assert(p);
-    for (i32 i = 0; i < PROC_FD_MAX; i++) {
-        if (!p->fd_table[i].is_open)
-            return i;
-    }
-    return -1;
-}
-
 static i64 sys_exit(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td)
@@ -110,31 +101,22 @@ static i64 sys_write(struct trap_frame *tf, struct sched_task *td)
     if (!p || !validate_fd_number(fd))
         return -(i64) EBADF;
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[fd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EBADF;
-    }
+    struct cap_ref ref = cap_lookup_fd(p, fd, CAP_RIGHT_WRITE);
+    if (!ref.ptr)
+        return cap_fd_is_valid(p, fd) ? -(i64) EACCES : -(i64) EBADF;
+    struct fd_pool_entry *entry = ref.ptr;
+    i64 rc;
 
-    /* Pipe dispatch: release fd_lock before blocking I/O.
-     * Bump the pipe's writer refcount first so concurrent close() on
-     * the last FD cannot free the pipe during the operation.
-     */
-    if (p->fd_table[fd].is_pipe) {
-        struct pipe *pipe = p->fd_table[fd].pipe;
-        bool is_write = !p->fd_table[fd].pipe_read_end;
-        if (!is_write) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) EBADF;
+    if (entry->kind == CAP_FD_KIND_PIPE) {
+        struct pipe *pipe = entry->pipe;
+        if (entry->pipe_read_end) {
+            rc = -(i64) EBADF;
+            goto out;
         }
-        u64 pf = spin_lock_irqsave(&pipe->lock);
-        pipe->writers++;
-        spin_unlock_irqrestore(&pipe->lock, pf);
-        proc_fd_unlock_irqrestore(p, fd_flags);
 
         if (len <= 0) {
-            pipe_close_write(pipe);
-            return 0;
+            rc = 0;
+            goto out;
         }
         if (len > PIPE_BUF_SIZE)
             len = PIPE_BUF_SIZE;
@@ -145,70 +127,68 @@ static i64 sys_write(struct trap_frame *tf, struct sched_task *td)
          * interleave their data, breaking POSIX PIPE_BUF atomicity.
          */
         char kbuf[PIPE_BUF_SIZE];
-        i64 rc = copy_from_user(kbuf, ubuf, len);
-        if (rc < 0) {
-            pipe_close_write(pipe);
-            return rc;
-        }
-        i64 written = pipe_write(pipe, kbuf, len);
-        pipe_close_write(pipe);
-        return written;
+        rc = copy_from_user(kbuf, ubuf, len);
+        if (rc < 0)
+            goto out;
+        rc = pipe_write(pipe, kbuf, len);
+        goto out;
     }
 
     if (len <= 0) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return 0;
+        rc = 0;
+        goto out;
     }
     if (len > 4096)
         len = 4096;
 
-    /* fd 1/2 = stdout/stderr -> console output. */
-    if (fd == PROC_FD_STDOUT || fd == PROC_FD_STDERR) {
+    if (entry->kind == CAP_FD_KIND_CONSOLE) {
+        if (entry->console_id != PROC_FD_STDOUT &&
+            entry->console_id != PROC_FD_STDERR) {
+            rc = -(i64) EBADF;
+            goto out;
+        }
         char kbuf[256];
         sz total = 0;
         while (total < len) {
             sz chunk = len - total;
             if (chunk > (sz) sizeof(kbuf))
                 chunk = (sz) sizeof(kbuf);
-            i64 rc = copy_from_user(kbuf, ubuf + total, chunk);
-            if (rc < 0) {
-                proc_fd_unlock_irqrestore(p, fd_flags);
-                return rc;
-            }
+            rc = copy_from_user(kbuf, ubuf + total, chunk);
+            if (rc < 0)
+                goto out;
             print_str((struct str) {.dat = kbuf, .len = chunk});
             total += chunk;
         }
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return total;
+        rc = (i64) total;
+        goto out;
     }
 
     char kbuf[256];
     sz total = 0;
-    sz base_off = p->fd_table[fd].offset;
+    sz base_off = entry->offset;
     while (total < len) {
         sz chunk = len - total;
         if (chunk > (sz) sizeof(kbuf))
             chunk = (sz) sizeof(kbuf);
-        i64 rc = copy_from_user(kbuf, ubuf + total, chunk);
-        if (rc < 0) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return rc;
-        }
+        rc = copy_from_user(kbuf, ubuf + total, chunk);
+        if (rc < 0)
+            goto out;
         struct byte_view bv = byte_view_new(kbuf, chunk);
-        struct result_sz wres =
-            vfs_write(&p->fd_table[fd].file, bv, base_off + total);
+        struct result_sz wres = vfs_write(&entry->file, bv, base_off + total);
         if (wres.is_error) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) wres.code;
+            rc = -(i64) wres.code;
+            goto out;
         }
         sz written = result_sz_checked(wres);
         if (written == 0)
             break;
         total += written;
     }
-    p->fd_table[fd].offset = base_off + total;
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return total;
+    entry->offset = base_off + total;
+    rc = (i64) total;
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_read(struct trap_frame *tf, struct sched_task *td)
@@ -221,31 +201,22 @@ static i64 sys_read(struct trap_frame *tf, struct sched_task *td)
     if (!p || !validate_fd_number(fd))
         return -(i64) EBADF;
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[fd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EBADF;
-    }
+    struct cap_ref ref = cap_lookup_fd(p, fd, CAP_RIGHT_READ);
+    if (!ref.ptr)
+        return cap_fd_is_valid(p, fd) ? -(i64) EACCES : -(i64) EBADF;
+    struct fd_pool_entry *entry = ref.ptr;
+    i64 rc;
 
-    /* Pipe dispatch: release fd_lock before blocking I/O.
-     * Bump the pipe's reader refcount first so concurrent close() on
-     * the last FD cannot free the pipe during the operation.
-     */
-    if (p->fd_table[fd].is_pipe) {
-        struct pipe *pipe = p->fd_table[fd].pipe;
-        bool is_read = p->fd_table[fd].pipe_read_end;
-        if (!is_read) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) EBADF;
+    if (entry->kind == CAP_FD_KIND_PIPE) {
+        struct pipe *pipe = entry->pipe;
+        if (!entry->pipe_read_end) {
+            rc = -(i64) EBADF;
+            goto out;
         }
-        u64 pf = spin_lock_irqsave(&pipe->lock);
-        pipe->readers++;
-        spin_unlock_irqrestore(&pipe->lock, pf);
-        proc_fd_unlock_irqrestore(p, fd_flags);
 
         if (len <= 0) {
-            pipe_close_read(pipe);
-            return 0;
+            rc = 0;
+            goto out;
         }
         if (len > 4096)
             len = 4096;
@@ -253,12 +224,12 @@ static i64 sys_read(struct trap_frame *tf, struct sched_task *td)
         /* Validate the entire user buffer before consuming pipe bytes.
          * pipe_read advances the head irreversibly, so a late EFAULT
          * from copy_to_user would lose data from a non-seekable FD.
-         * Must check writability (PTE_W), not just accessibility -
+         * Must check writability (PTE_W), not just accessibility:
          * a read-only mapping passes user_addr_valid but faults on write.
          */
         if (!user_addr_writable(ubuf, len)) {
-            pipe_close_read(pipe);
-            return -(i64) EFAULT;
+            rc = -(i64) EFAULT;
+            goto out;
         }
 
         char kbuf[256];
@@ -269,63 +240,62 @@ static i64 sys_read(struct trap_frame *tf, struct sched_task *td)
                 chunk = (sz) sizeof(kbuf);
             i64 got = pipe_read(pipe, kbuf, chunk);
             if (got < 0) {
-                pipe_close_read(pipe);
-                return total > 0 ? (i64) total : got;
+                rc = total > 0 ? (i64) total : got;
+                goto out;
             }
             if (got == 0)
                 break;
-            i64 rc = copy_to_user(ubuf + total, kbuf, (sz) got);
+            rc = copy_to_user(ubuf + total, kbuf, (sz) got);
             if (rc < 0) {
-                pipe_close_read(pipe);
-                return total > 0 ? (i64) total : rc;
+                rc = total > 0 ? (i64) total : rc;
+                goto out;
             }
             total += (sz) got;
             if ((sz) got < chunk)
                 break; /* short read: don't block again */
         }
-        pipe_close_read(pipe);
-        return (i64) total;
+        rc = (i64) total;
+        goto out;
     }
 
-    if (fd == PROC_FD_STDIN) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return 0;
+    if (entry->kind == CAP_FD_KIND_CONSOLE) {
+        rc = 0;
+        goto out;
     }
 
     if (len <= 0) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return 0;
+        rc = 0;
+        goto out;
     }
     if (len > 4096)
         len = 4096;
 
     char kbuf[256];
     sz total = 0;
-    sz base_off = p->fd_table[fd].offset;
+    sz base_off = entry->offset;
     while (total < len) {
         sz chunk = len - total;
         if (chunk > (sz) sizeof(kbuf))
             chunk = (sz) sizeof(kbuf);
         struct byte_buf bb = byte_buf_new(kbuf, 0, chunk);
-        struct result_sz rres =
-            vfs_read(&p->fd_table[fd].file, &bb, base_off + total);
+        struct result_sz rres = vfs_read(&entry->file, &bb, base_off + total);
         if (rres.is_error) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) rres.code;
+            rc = -(i64) rres.code;
+            goto out;
         }
         sz got = result_sz_checked(rres);
         if (got == 0)
             break;
-        i64 rc = copy_to_user(ubuf + total, kbuf, got);
-        if (rc < 0) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return rc;
-        }
+        rc = copy_to_user(ubuf + total, kbuf, got);
+        if (rc < 0)
+            goto out;
         total += got;
     }
-    p->fd_table[fd].offset = base_off + total;
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return total;
+    entry->offset = base_off + total;
+    rc = (i64) total;
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
@@ -337,11 +307,7 @@ static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
     if (!p)
         return -(i64) EPERM;
 
-    /* Preserve EMFILE semantics before touching user memory. */
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    i32 fd = find_free_fd_locked(p);
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    if (fd < 0)
+    if (cap_find_free_fd(p) < 0)
         return -(i64) EMFILE;
 
     i64 perr;
@@ -350,26 +316,24 @@ static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
     if (perr < 0)
         return perr;
 
+    struct result_vfs_stat st = vfs_stat(path);
+    if (st.is_error)
+        return -(i64) st.code;
+    struct vfs_stat vstat = result_vfs_stat_checked(st);
+    /* GRANT is set only on system-minted FDs and on supervisor-opened FDs
+     * explicitly flagged for delegation (e.g., SPAWN_FA_OPEN). Plain sys_open
+     * mints a non-delegable cap.
+     */
+    u8 rights = CAP_RIGHT_READ;
+    if ((vstat.flags & VFS_FLAG_RDONLY) == 0)
+        rights |= CAP_RIGHT_WRITE;
+    bool is_seekable = (vstat.flags & VFS_FLAG_NOSEEK) == 0;
+
     struct result_vfs_file fres = vfs_open(path);
     if (fres.is_error)
         return -(i64) fres.code;
-
-    fd_flags = proc_fd_lock_irqsave(p);
-    fd = find_free_fd_locked(p);
-    if (fd < 0) {
-        struct vfs_file file = result_vfs_file_checked(fres);
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        vfs_close(&file);
-        return -(i64) EMFILE;
-    }
-
-    p->fd_table[fd] = (struct proc_fd) {
-        .is_open = true,
-        .is_seekable = true,
-        .file = result_vfs_file_checked(fres),
-    };
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return fd;
+    return (i64) cap_open_vfs(p, result_vfs_file_checked(fres), rights,
+                              is_seekable, -1, false);
 }
 
 static i64 sys_close(struct trap_frame *tf, struct sched_task *td)
@@ -380,15 +344,7 @@ static i64 sys_close(struct trap_frame *tf, struct sched_task *td)
     if (!p || !validate_fd_number(fd))
         return -(i64) EBADF;
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[fd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EBADF;
-    }
-
-    proc_close_fd_locked(p, fd);
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return 0;
+    return cap_close_fd(p, fd);
 }
 
 static i64 sys_stat(struct trap_frame *tf, struct sched_task *td)
@@ -559,6 +515,7 @@ static i64 sys_spawn(struct trap_frame *tf, struct sched_task *td)
         return -(i64) ENOMEM;
     }
     child->parent_pid = parent->pid;
+    child->parent_generation = parent->generation;
 
     /* Copy binary name into child proc. */
     sz namelen = pathlen < 31 ? pathlen : 31;
@@ -594,50 +551,16 @@ static i64 sys_spawn(struct trap_frame *tf, struct sched_task *td)
 
     kvalloc_free(buf_ba);
 
-    /* Inherit parent's FD table so file actions (especially DUP2) can
-     * reference descriptors that are open in the parent.
-     *
-     * Pipe FDs: inherit with refcount bump (pipes have proper lifecycle).
-     * Console FDs (stdin/stdout/stderr without VFS backing): inherit as-is.
-     * VFS file FDs: do NOT inherit - the VFS layer has no refcounting,
-     * so sharing a struct vfs_file across processes leads to use-after-free
-     * when either side closes the descriptor.  Callers that need file
-     * redirection must use SPAWN_FA_OPEN file actions instead.
-     *
-     * Lock ordering: parent fd_lock first (read), child fd_lock second
-     * (write, uncontended - child is EMBRYO, invisible to other harts).
-     */
-    {
-        u64 pf = proc_fd_lock_irqsave(parent);
-        u64 cf = proc_fd_lock_irqsave(child);
-        for (i32 i = 0; i < PROC_FD_MAX; i++) {
-            if (!parent->fd_table[i].is_open)
-                continue;
-            if (parent->fd_table[i].is_pipe) {
-                child->fd_table[i] = parent->fd_table[i];
-                struct pipe *pipe = child->fd_table[i].pipe;
-                /* IRQs already disabled by parent fd_lock; plain
-                 * spin_lock avoids redundant irqsave/restore.
-                 */
-                spin_lock(&pipe->lock);
-                if (child->fd_table[i].pipe_read_end)
-                    pipe->readers++;
-                else
-                    pipe->writers++;
-                spin_unlock(&pipe->lock);
-            } else if (!parent->fd_table[i].is_seekable) {
-                /* Console FD (no VFS backing): safe to copy by value. */
-                child->fd_table[i] = parent->fd_table[i];
-            }
-            /* VFS file FDs (is_seekable && !is_pipe): skip - no refcount,
-             * sharing leads to use-after-free on close.
-             */
+    for (i32 fd = 0; fd < PROC_FD_MAX; fd++) {
+        if (!cap_fd_is_valid(parent, fd))
+            continue;
+        i32 inherit_rc = cap_inherit_fd(parent, child, fd, fd);
+        if (inherit_rc < 0) {
+            proc_free(child);
+            return (i64) inherit_rc;
         }
-        proc_fd_unlock_irqrestore(child, cf);
-        proc_fd_unlock_irqrestore(parent, pf);
     }
 
-    /* Apply file actions to child's FD table (child still in EMBRYO). */
     if (fa_count > 0) {
         i32 fa_rc = spawn_apply_file_actions(child, kfa, fa_count);
         if (fa_rc < 0) {
@@ -698,43 +621,13 @@ static i64 sys_getppid(struct trap_frame *tf, struct sched_task *td)
     return p ? (i64) p->parent_pid : 0;
 }
 
-/* Bump pipe refcount after duplicating a pipe FD.  Caller holds fd_lock. */
-static void pipe_bump_refcount(struct proc_fd *f)
-{
-    if (!f->is_pipe)
-        return;
-    u64 pf = spin_lock_irqsave(&f->pipe->lock);
-    if (f->pipe_read_end)
-        f->pipe->readers++;
-    else
-        f->pipe->writers++;
-    spin_unlock_irqrestore(&f->pipe->lock, pf);
-}
-
 static i64 sys_dup(struct trap_frame *tf, struct sched_task *td)
 {
     i32 oldfd = (i32) tf->a0;
     struct proc *p = td->proc;
     if (!p || !validate_fd_number(oldfd))
         return -(i64) EBADF;
-
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[oldfd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EBADF;
-    }
-
-    i32 newfd = find_free_fd_locked(p);
-    if (newfd < 0) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EMFILE;
-    }
-
-    p->fd_table[newfd] = p->fd_table[oldfd];
-    p->fd_table[newfd].is_dup = true;
-    pipe_bump_refcount(&p->fd_table[newfd]);
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return newfd;
+    return (i64) cap_dup_fd(p, oldfd, -1, false);
 }
 
 static i64 sys_dup2(struct trap_frame *tf, struct sched_task *td)
@@ -744,25 +637,9 @@ static i64 sys_dup2(struct trap_frame *tf, struct sched_task *td)
     struct proc *p = td->proc;
     if (!p || !validate_fd_number(oldfd))
         return -(i64) EBADF;
-    if (newfd < 0 || newfd >= PROC_FD_MAX)
+    if (!validate_fd_number(newfd))
         return -(i64) EBADF;
-
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[oldfd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EBADF;
-    }
-    if (oldfd == newfd) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return newfd;
-    }
-    if (p->fd_table[newfd].is_open)
-        proc_close_fd_locked(p, newfd);
-    p->fd_table[newfd] = p->fd_table[oldfd];
-    p->fd_table[newfd].is_dup = true;
-    pipe_bump_refcount(&p->fd_table[newfd]);
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return newfd;
+    return (i64) cap_dup_fd(p, oldfd, newfd, true);
 }
 
 static i64 sys_lseek(struct trap_frame *tf, struct sched_task *td)
@@ -775,58 +652,60 @@ static i64 sys_lseek(struct trap_frame *tf, struct sched_task *td)
     if (!p || !validate_fd_number(fd))
         return -(i64) EBADF;
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-    if (!p->fd_table[fd].is_open) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
+    struct cap_ref ref = cap_lookup_fd(p, fd, 0);
+    if (!ref.ptr)
         return -(i64) EBADF;
-    }
-    if (!p->fd_table[fd].is_seekable) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) ESPIPE;
+    struct fd_pool_entry *entry = ref.ptr;
+    i64 rc;
+    if (!entry->is_seekable) {
+        rc = -(i64) ESPIPE;
+        goto out;
     }
 
-    sz cur = p->fd_table[fd].offset;
+    sz cur = entry->offset;
     sz new_off;
 
     switch (whence) {
     case SEEK_SET:
         if (offset < 0) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) EINVAL;
+            rc = -(i64) EINVAL;
+            goto out;
         }
         new_off = (sz) offset;
         break;
     case SEEK_CUR: {
         u64 delta = (offset < 0) ? (u64) (-(offset + 1)) + 1 : (u64) offset;
         if (offset < 0 && delta > (u64) cur) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) EINVAL;
+            rc = -(i64) EINVAL;
+            goto out;
         }
         if (offset > 0 && (u64) cur > (u64) (I64_MAX - offset)) {
-            proc_fd_unlock_irqrestore(p, fd_flags);
-            return -(i64) EINVAL;
+            rc = -(i64) EINVAL;
+            goto out;
         }
         new_off = cur + (sz) offset;
         break;
     }
     case SEEK_END:
         /* Needs vfs_file_size() - not yet available. */
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) ENOSYS;
+        rc = -(i64) ENOSYS;
+        goto out;
     default:
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EINVAL;
+        rc = -(i64) EINVAL;
+        goto out;
     }
 
     /* Guard: new_off must fit in i64 for the return value. */
     if (new_off > (sz) I64_MAX) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
-        return -(i64) EINVAL;
+        rc = -(i64) EINVAL;
+        goto out;
     }
 
-    p->fd_table[fd].offset = new_off;
-    proc_fd_unlock_irqrestore(p, fd_flags);
-    return (i64) new_off;
+    entry->offset = new_off;
+    rc = (i64) new_off;
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_chdir(struct trap_frame *tf, struct sched_task *td)
@@ -934,36 +813,20 @@ static i64 sys_pipe(struct trap_frame *tf, struct sched_task *td)
     if (!pipe)
         return -(i64) ENOMEM;
 
-    u64 fd_flags = proc_fd_lock_irqsave(p);
-
-    /* Find two free FDs. */
-    i32 rfd = find_free_fd_locked(p);
-    i32 wfd = -1;
-    if (rfd >= 0) {
-        p->fd_table[rfd].is_open = true;
-        wfd = find_free_fd_locked(p);
-        p->fd_table[rfd].is_open = false;
-    }
-    if (rfd < 0 || wfd < 0) {
-        proc_fd_unlock_irqrestore(p, fd_flags);
+    i32 rfd = cap_open_pipe(p, pipe, true, CAP_RIGHT_READ | CAP_RIGHT_GRANT, -1,
+                            false);
+    if (rfd < 0) {
         pipe_close_read(pipe);
         pipe_close_write(pipe);
-        return -(i64) EMFILE;
+        return rfd;
     }
-
-    p->fd_table[rfd] = (struct proc_fd) {
-        .is_open = true,
-        .is_pipe = true,
-        .pipe_read_end = true,
-        .pipe = pipe,
-    };
-    p->fd_table[wfd] = (struct proc_fd) {
-        .is_open = true,
-        .is_pipe = true,
-        .pipe = pipe,
-    };
-
-    proc_fd_unlock_irqrestore(p, fd_flags);
+    i32 wfd = cap_open_pipe(p, pipe, false, CAP_RIGHT_WRITE | CAP_RIGHT_GRANT,
+                            -1, false);
+    if (wfd < 0) {
+        proc_close_fd(p, rfd);
+        pipe_close_write(pipe);
+        return wfd;
+    }
 
     /* Copy FD pair to user-space: fds[0] = read, fds[1] = write. */
     i32 kfds[2] = {rfd, wfd};
@@ -1511,13 +1374,9 @@ static i64 sys_fsync_common(struct sched_task *td, i32 fd)
     struct proc *p = td ? td->proc : NULL;
     if (!p || !validate_fd_number(fd))
         return -(i64) EBADF;
-    u64 flags = proc_fd_lock_irqsave(p);
-    bool open = p->fd_table[fd].is_open;
-    bool is_pipe = p->fd_table[fd].is_pipe;
-    proc_fd_unlock_irqrestore(p, flags);
-    if (!open)
+    if (!cap_fd_is_valid(p, fd))
         return -(i64) EBADF;
-    if (is_pipe)
+    if (cap_fd_is_pipe(p, fd))
         return -(i64) EINVAL;
     return 0;
 }
@@ -1537,49 +1396,88 @@ static i64 sys_fdatasync(struct trap_frame *tf, struct sched_task *td)
 static i64 sys_mutex_init_h(struct trap_frame *tf __unused,
                             struct sched_task *td __unused)
 {
-    i32 h = sync_mutex_alloc(td->proc);
-    return (i64) h;
+    i32 object_index = sync_mutex_alloc(td->proc);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_handle(td->proc, (u16) object_index, CAP_TYPE_MUTEX,
+                                 CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        sync_mutex_put_idx(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_mutex_lock_h(struct trap_frame *tf,
                             struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct pi_mutex *mtx = sync_mutex_get(handle, td->proc);
-    if (!mtx)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    i64 rc;
+    struct pi_mutex *mtx = sync_mutex_get((i32) ref.object_index);
+    if (!mtx) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) pi_mutex_lock_interruptible(mtx));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_mutex_trylock_h(struct trap_frame *tf,
                                struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct pi_mutex *mtx = sync_mutex_get(handle, td->proc);
-    if (!mtx)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!ref.type)
         return -(i64) EINVAL;
-    return (i64) pi_mutex_trylock(mtx);
+    struct pi_mutex *mtx = sync_mutex_get((i32) ref.object_index);
+    i64 rc = mtx ? (i64) pi_mutex_trylock(mtx) : -(i64) EINVAL;
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_mutex_unlock_h(struct trap_frame *tf,
                               struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct pi_mutex *mtx = sync_mutex_get(handle, td->proc);
-    if (!mtx)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!ref.type)
         return -(i64) EINVAL;
+    struct pi_mutex *mtx = sync_mutex_get((i32) ref.object_index);
+    if (!mtx) {
+        cap_put_ref(&ref);
+        return -(i64) EINVAL;
+    }
     pi_mutex_unlock(mtx);
+    cap_put_ref(&ref);
     return 0;
 }
 
 static i64 sys_cond_init_h(struct trap_frame *tf __unused,
                            struct sched_task *td __unused)
 {
-    i32 h = sync_condvar_alloc(td->proc);
-    return (i64) h;
+    i32 object_index = sync_condvar_alloc(td->proc);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_handle(td->proc, (u16) object_index, CAP_TYPE_CONDVAR,
+                                 CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        sync_condvar_put_idx(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_cond_wait_h(struct trap_frame *tf,
@@ -1587,14 +1485,33 @@ static i64 sys_cond_wait_h(struct trap_frame *tf,
 {
     i32 cv_h = (i32) tf->a0;
     i32 mtx_h = (i32) tf->a1;
-    struct condvar *cv = sync_condvar_get(cv_h, td->proc);
-    struct pi_mutex *mtx = sync_mutex_get(mtx_h, td->proc);
-    if (!cv || !mtx)
+    struct cap_ref cv_ref =
+        cap_lookup_object(td->proc, cv_h, CAP_RIGHT_WRITE, CAP_TYPE_CONDVAR);
+    if (!cv_ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(tf, td,
-                                              (i64) condvar_wait(cv, mtx));
+    struct cap_ref mtx_ref =
+        cap_lookup_object(td->proc, mtx_h, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!mtx_ref.type) {
+        cap_put_ref(&cv_ref);
+        return -(i64) EINVAL;
+    }
+    i64 rc;
+    struct condvar *cv = sync_condvar_get((i32) cv_ref.object_index);
+    struct pi_mutex *mtx = sync_mutex_get((i32) mtx_ref.object_index);
+    if (!cv || !mtx) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc =
+        maybe_cancel_at_cancellation_point(tf, td, (i64) condvar_wait(cv, mtx));
+out:
+    cap_put_ref(&mtx_ref);
+    cap_put_ref(&cv_ref);
+    return rc;
 }
 
 /* Convert an absolute CLOCK_MONOTONIC timespec (in user space) to a
@@ -1686,75 +1603,130 @@ static i64 sys_cond_timedwait_h(struct trap_frame *tf,
     i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
     if (rc < 0)
         return rc;
-    struct condvar *cv = sync_condvar_get(cv_h, td->proc);
-    struct pi_mutex *mtx = sync_mutex_get(mtx_h, td->proc);
-    if (!cv || !mtx)
+    struct cap_ref cv_ref =
+        cap_lookup_object(td->proc, cv_h, CAP_RIGHT_WRITE, CAP_TYPE_CONDVAR);
+    if (!cv_ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    struct cap_ref mtx_ref =
+        cap_lookup_object(td->proc, mtx_h, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!mtx_ref.type) {
+        cap_put_ref(&cv_ref);
+        return -(i64) EINVAL;
+    }
+    struct condvar *cv = sync_condvar_get((i32) cv_ref.object_index);
+    struct pi_mutex *mtx = sync_mutex_get((i32) mtx_ref.object_index);
+    if (!cv || !mtx) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) condvar_wait_timeout(cv, mtx, timeout));
+out:
+    cap_put_ref(&mtx_ref);
+    cap_put_ref(&cv_ref);
+    return rc;
 }
 
 static i64 sys_cond_signal_h(struct trap_frame *tf,
                              struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct condvar *cv = sync_condvar_get(handle, td->proc);
-    if (!cv)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_CONDVAR);
+    if (!ref.type)
         return -(i64) EINVAL;
-    condvar_signal(cv);
-    return 0;
+    struct condvar *cv = sync_condvar_get((i32) ref.object_index);
+    if (cv)
+        condvar_signal(cv);
+    cap_put_ref(&ref);
+    return cv ? 0 : -(i64) EINVAL;
 }
 
 static i64 sys_cond_broadcast_h(struct trap_frame *tf,
                                 struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct condvar *cv = sync_condvar_get(handle, td->proc);
-    if (!cv)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_CONDVAR);
+    if (!ref.type)
         return -(i64) EINVAL;
-    condvar_broadcast(cv);
-    return 0;
+    struct condvar *cv = sync_condvar_get((i32) ref.object_index);
+    if (cv)
+        condvar_broadcast(cv);
+    cap_put_ref(&ref);
+    return cv ? 0 : -(i64) EINVAL;
 }
 
 static i64 sys_sem_init_h(struct trap_frame *tf, struct sched_task *td __unused)
 {
     i32 initial = (i32) tf->a0;
-    i32 h = sync_sem_alloc(td->proc, initial);
-    return (i64) h;
+    i32 object_index = sync_sem_alloc(td->proc, initial);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle =
+        cap_open_handle(td->proc, (u16) object_index, CAP_TYPE_SEMAPHORE,
+                        CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        sync_sem_put_idx(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_sem_wait_h(struct trap_frame *tf, struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct semaphore *s = sync_sem_get(handle, td->proc);
-    if (!s)
+    struct cap_ref ref = cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE,
+                                           CAP_TYPE_SEMAPHORE);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(tf, td,
-                                              (i64) sem_wait_interruptible(s));
+    i64 rc;
+    struct semaphore *s = sync_sem_get((i32) ref.object_index);
+    if (!s) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td,
+                                            (i64) sem_wait_interruptible(s));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_sem_trywait_h(struct trap_frame *tf,
                              struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct semaphore *s = sync_sem_get(handle, td->proc);
-    if (!s)
+    struct cap_ref ref = cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE,
+                                           CAP_TYPE_SEMAPHORE);
+    if (!ref.type)
         return -(i64) EINVAL;
-    return (i64) sem_trywait(s);
+    struct semaphore *s = sync_sem_get((i32) ref.object_index);
+    i64 rc = s ? (i64) sem_trywait(s) : -(i64) EINVAL;
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_sem_post_h(struct trap_frame *tf, struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct semaphore *s = sync_sem_get(handle, td->proc);
-    if (!s)
+    struct cap_ref ref = cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE,
+                                           CAP_TYPE_SEMAPHORE);
+    if (!ref.type)
         return -(i64) EINVAL;
-    sem_post(s);
-    return 0;
+    struct semaphore *s = sync_sem_get((i32) ref.object_index);
+    if (s)
+        sem_post(s);
+    cap_put_ref(&ref);
+    return s ? 0 : -(i64) EINVAL;
 }
 
 static i64 sys_sem_timedwait_h(struct trap_frame *tf,
@@ -1766,13 +1738,24 @@ static i64 sys_sem_timedwait_h(struct trap_frame *tf,
     i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
     if (rc < 0)
         return rc;
-    struct semaphore *s = sync_sem_get(handle, td->proc);
-    if (!s)
+    struct cap_ref ref = cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE,
+                                           CAP_TYPE_SEMAPHORE);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(tf, td,
-                                              (i64) sem_timedwait(s, timeout));
+    struct semaphore *s = sync_sem_get((i32) ref.object_index);
+    if (!s) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td,
+                                            (i64) sem_timedwait(s, timeout));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 /* --- POSIX barriers (item 15i) --- */
@@ -1781,33 +1764,64 @@ static i64 sys_barrier_init_h(struct trap_frame *tf,
                               struct sched_task *td __unused)
 {
     u32 count = (u32) tf->a0;
-    i32 h = sync_barrier_alloc(td->proc, count);
-    return (i64) h;
+    i32 object_index = sync_barrier_alloc(td->proc, count);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_handle(td->proc, (u16) object_index, CAP_TYPE_BARRIER,
+                                 CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        sync_barrier_put_idx(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_barrier_wait_h(struct trap_frame *tf,
                               struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct barrier *b = sync_barrier_get(handle, td->proc);
-    if (!b)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_BARRIER);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    i64 rc;
+    struct barrier *b = sync_barrier_get((i32) ref.object_index);
+    if (!b) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) barrier_wait_interruptible(b));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_barrier_destroy_h(struct trap_frame *tf,
                                  struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct barrier *b = sync_barrier_get(handle, td->proc);
-    if (!b)
+    /* Pin across barrier_destroy so a concurrent destroy cannot free the
+     * pool entry while we still operate on the primitive.
+     */
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_BARRIER);
+    if (!ref.type)
         return -(i64) EINVAL;
+    struct cap_slot_view slot = cap_slot_read(td->proc, handle);
+    struct barrier *b = sync_barrier_get((i32) ref.object_index);
+    if (!b || !slot.valid) {
+        cap_put_ref(&ref);
+        return -(i64) EINVAL;
+    }
     i32 rc = barrier_destroy(b);
+    cap_put_ref(&ref);
     if (rc == 0)
-        sync_barrier_free(handle, td->proc);
+        return cap_drop_token(td->proc, cap_make_handle(&slot));
     return (i64) rc;
 }
 
@@ -1816,65 +1830,109 @@ static i64 sys_barrier_destroy_h(struct trap_frame *tf,
 static i64 sys_rwlock_init_h(struct trap_frame *tf __unused,
                              struct sched_task *td __unused)
 {
-    i32 h = sync_rwlock_alloc(td->proc);
-    return (i64) h;
+    i32 object_index = sync_rwlock_alloc(td->proc);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_handle(td->proc, (u16) object_index, CAP_TYPE_RWLOCK,
+                                 CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        sync_rwlock_put_idx(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_rwlock_rdlock_h(struct trap_frame *tf,
                                struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    i64 rc;
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (!rw) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) rwlock_rdlock_interruptible(rw));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_wrlock_h(struct trap_frame *tf,
                                struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    i64 rc;
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (!rw) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) rwlock_wrlock_interruptible(rw));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_tryrdlock_h(struct trap_frame *tf,
                                   struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    return (i64) rwlock_tryrdlock(rw);
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    i64 rc = rw ? (i64) rwlock_tryrdlock(rw) : -(i64) EINVAL;
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_trywrlock_h(struct trap_frame *tf,
                                   struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    return (i64) rwlock_trywrlock(rw);
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    i64 rc = rw ? (i64) rwlock_trywrlock(rw) : -(i64) EINVAL;
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_unlock_h(struct trap_frame *tf,
                                struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    rwlock_unlock(rw);
-    return 0;
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (rw)
+        rwlock_unlock(rw);
+    cap_put_ref(&ref);
+    return rw ? 0 : -(i64) EINVAL;
 }
 
 static i64 sys_rwlock_timedrdlock_h(struct trap_frame *tf,
@@ -1886,13 +1944,24 @@ static i64 sys_rwlock_timedrdlock_h(struct trap_frame *tf,
     i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
     if (rc < 0)
         return rc;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (!rw) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) rwlock_timedrdlock(rw, timeout));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_timedwrlock_h(struct trap_frame *tf,
@@ -1904,25 +1973,47 @@ static i64 sys_rwlock_timedwrlock_h(struct trap_frame *tf,
     i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
     if (rc < 0)
         return rc;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (!rw) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
         tf, td, (i64) rwlock_timedwrlock(rw, timeout));
+out:
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_rwlock_destroy_h(struct trap_frame *tf,
                                 struct sched_task *td __unused)
 {
     i32 handle = (i32) tf->a0;
-    struct rwlock *rw = sync_rwlock_get(handle, td->proc);
-    if (!rw)
+    /* Pin across rwlock_destroy: a concurrent destroy must not free the
+     * pool entry under us.
+     */
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
+    if (!ref.type)
         return -(i64) EINVAL;
+    struct cap_slot_view slot = cap_slot_read(td->proc, handle);
+    struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
+    if (!rw || !slot.valid) {
+        cap_put_ref(&ref);
+        return -(i64) EINVAL;
+    }
     i32 rc = rwlock_destroy(rw);
+    cap_put_ref(&ref);
     if (rc == 0)
-        sync_rwlock_free(handle, td->proc);
+        return cap_drop_token(td->proc, cap_make_handle(&slot));
     return (i64) rc;
 }
 
@@ -1933,112 +2024,130 @@ static i64 sys_mq_open(struct trap_frame *tf, struct sched_task *td)
     u32 max_msgs = (u32) tf->a0;
     sz max_msg_size = (sz) tf->a1;
     struct proc *p = td ? td->proc : NULL;
-    return (i64) mqueue_open(p, max_msgs, max_msg_size);
+    i32 object_index = mqueue_open(p, max_msgs, max_msg_size);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_handle(p, (u16) object_index, CAP_TYPE_MQUEUE,
+                                 CAP_RIGHT_READ | CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        (void) mqueue_close(object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_mq_close(struct trap_frame *tf, struct sched_task *td)
 {
     i32 handle = (i32) tf->a0;
-    struct proc *p = td ? td->proc : NULL;
-    if (!mqueue_check_owner(handle, p))
-        return -(i64) EPERM;
-    return (i64) mqueue_close(handle);
+    struct cap_slot_view slot;
+    if (!cap_lookup_slot(td->proc, handle, 0, CAP_TYPE_MQUEUE, &slot))
+        return -(i64) EINVAL;
+    return cap_drop_token(td->proc, cap_make_handle(&slot));
 }
 
 static i64 sys_mq_send(struct trap_frame *tf, struct sched_task *td)
 {
     i32 handle = (i32) tf->a0;
-    struct proc *p = td ? td->proc : NULL;
-    if (!mqueue_check_owner(handle, p))
-        return -(i64) EPERM;
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MQUEUE);
+    if (!ref.type)
+        return -(i64) EINVAL;
     ptr u_msg = (ptr) tf->a1;
     sz len = (sz) tf->a2;
     u32 priority = (u32) tf->a3;
+    i64 rc;
 
-    if (len <= 0 || len > MQ_MAX_MSG_SIZE)
-        return -(i64) EMSGSIZE;
+    if (len <= 0 || len > MQ_MAX_MSG_SIZE) {
+        rc = -(i64) EMSGSIZE;
+        goto out;
+    }
 
     u8 kbuf[MQ_MAX_MSG_SIZE];
-    i64 rc = copy_from_user(kbuf, u_msg, len);
+    rc = copy_from_user(kbuf, u_msg, len);
     if (rc < 0)
-        return rc;
+        goto out;
+
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = maybe_cancel_at_cancellation_point(
+        tf, td, (i64) mqueue_send((i32) ref.object_index, kbuf, len, priority));
+out:
+    cap_put_ref(&ref);
+    return rc;
+}
+
+/* Shared receive body for sys_mq_{receive,timedreceive}. timed selects
+ * mqueue_timedreceive (which honors timeout); plain selects mqueue_receive
+ * (blocks indefinitely). On entry, ref is the pinned mqueue cap; the
+ * caller releases it on return.
+ */
+static i64 mq_receive_common(struct trap_frame *tf,
+                             struct sched_task *td,
+                             struct cap_ref *ref,
+                             ptr u_buf,
+                             sz buf_size,
+                             ptr u_prio,
+                             bool timed,
+                             struct time_ms timeout)
+{
+    if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
+        return -(i64) EINVAL;
 
     if (thread_cancel_enabled_pending(td))
         return cancel_thread_now(tf, td);
-    return maybe_cancel_at_cancellation_point(
-        tf, td, (i64) mqueue_send(handle, kbuf, len, priority));
+
+    u8 kbuf[MQ_MAX_MSG_SIZE];
+    u32 prio = 0;
+    i32 ret =
+        timed ? mqueue_timedreceive((i32) ref->object_index, kbuf, buf_size,
+                                    &prio, timeout)
+              : mqueue_receive((i32) ref->object_index, kbuf, buf_size, &prio);
+    if (ret < 0)
+        return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
+
+    i64 rc = copy_to_user(u_buf, kbuf, (sz) ret);
+    if (rc < 0)
+        return rc;
+    if (u_prio) {
+        rc = copy_to_user(u_prio, &prio, sizeof(prio));
+        if (rc < 0)
+            return rc;
+    }
+    return (i64) ret;
 }
 
 static i64 sys_mq_receive(struct trap_frame *tf, struct sched_task *td)
 {
     i32 handle = (i32) tf->a0;
-    struct proc *p = td ? td->proc : NULL;
-    if (!mqueue_check_owner(handle, p))
-        return -(i64) EPERM;
-    ptr u_buf = (ptr) tf->a1;
-    sz buf_size = (sz) tf->a2;
-    ptr u_prio = (ptr) tf->a3;
-
-    if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_READ, CAP_TYPE_MQUEUE);
+    if (!ref.type)
         return -(i64) EINVAL;
-
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-
-    u8 kbuf[MQ_MAX_MSG_SIZE];
-    u32 prio = 0;
-    i32 ret = mqueue_receive(handle, kbuf, buf_size, &prio);
-    if (ret < 0)
-        return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
-
-    i64 rc = copy_to_user(u_buf, kbuf, (sz) ret);
-    if (rc < 0)
-        return rc;
-    if (u_prio) {
-        rc = copy_to_user(u_prio, &prio, sizeof(prio));
-        if (rc < 0)
-            return rc;
-    }
-    return (i64) ret;
+    i64 rc = mq_receive_common(tf, td, &ref, (ptr) tf->a1, (sz) tf->a2,
+                               (ptr) tf->a3, false, (struct time_ms) {0});
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_mq_timedreceive(struct trap_frame *tf, struct sched_task *td)
 {
     i32 handle = (i32) tf->a0;
-    struct proc *p = td ? td->proc : NULL;
-    if (!mqueue_check_owner(handle, p))
-        return -(i64) EPERM;
-    ptr u_buf = (ptr) tf->a1;
-    sz buf_size = (sz) tf->a2;
-    ptr u_prio = (ptr) tf->a3;
-    ptr u_abs_ts = (ptr) tf->a4;
-
-    if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_READ, CAP_TYPE_MQUEUE);
+    if (!ref.type)
         return -(i64) EINVAL;
-
     struct time_ms timeout;
-    i64 trc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
-    if (trc < 0)
-        return trc;
-
-    if (thread_cancel_enabled_pending(td))
-        return cancel_thread_now(tf, td);
-
-    u8 kbuf[MQ_MAX_MSG_SIZE];
-    u32 prio = 0;
-    i32 ret = mqueue_timedreceive(handle, kbuf, buf_size, &prio, timeout);
-    if (ret < 0)
-        return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
-
-    i64 rc = copy_to_user(u_buf, kbuf, (sz) ret);
-    if (rc < 0)
+    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, (ptr) tf->a4, &timeout);
+    if (rc < 0) {
+        cap_put_ref(&ref);
         return rc;
-    if (u_prio) {
-        rc = copy_to_user(u_prio, &prio, sizeof(prio));
-        if (rc < 0)
-            return rc;
     }
-    return (i64) ret;
+    rc = mq_receive_common(tf, td, &ref, (ptr) tf->a1, (sz) tf->a2,
+                           (ptr) tf->a3, true, timeout);
+    cap_put_ref(&ref);
+    return rc;
 }
 
 /* --- PSE51 scheduling syscalls (item 17) --- */
@@ -2110,14 +2219,32 @@ static i64 sys_kill_h(struct trap_frame *tf, struct sched_task *td __unused)
 /* Forward declaration; defined alongside the other thread syscalls
  * later in the file.
  */
-static struct sched_task *thread_find_by_tid_locked(struct proc *p, u16 tid);
+static bool thread_lookup_cap(struct proc *p,
+                              u64 handle,
+                              u8 required_rights,
+                              struct cap_slot_view *out)
+{
+    return cap_lookup_token(p, handle, required_rights, CAP_TYPE_THREAD, out);
+}
+
+static struct sched_task *thread_from_cap_locked(
+    struct proc *p,
+    const struct cap_slot_view *slot)
+{
+    if (!p || !slot || slot->object_index >= PROC_THREAD_MAX)
+        return NULL;
+    struct sched_task *target = p->tasks[slot->object_index];
+    if (!target || target->td_cap_slot != (i16) slot->slot_index)
+        return NULL;
+    return target;
+}
 
 static bool thread_target_is_live(const struct sched_task *target);
 
 /* pthread_kill: thread-directed signal delivery within the calling
  * proc. Differs from kill(): the bit lands on a specific thread's
  * td_sig.pending rather than the per-proc proc_pending mask, so the
- * signal targets exactly that thread. Unknown TID -> ESRCH; signo==0
+ * signal targets exactly that thread. Unknown thread handle -> ESRCH; signo==0
  * is an existence check. SIGKILL is process-wide by definition and
  * is rejected with EINVAL since pthread_kill targeting a single
  * thread cannot meaningfully forward it.
@@ -2126,7 +2253,7 @@ static i64 sys_pthread_kill_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
+    u64 handle = tf->a0;
     i32 signo = (i32) tf->a1;
     struct proc *p = td->proc;
 
@@ -2135,10 +2262,12 @@ static i64 sys_pthread_kill_h(struct trap_frame *tf, struct sched_task *td)
     if (signo == SIGKILL)
         return -(i64) EINVAL;
 
-    struct sched_task *target = NULL;
+    struct cap_slot_view cap_slot;
+    if (!thread_lookup_cap(p, handle, CAP_RIGHT_WRITE, &cap_slot))
+        return -(i64) ESRCH;
 
     u64 tflags = proc_table_lock_irqsave();
-    target = thread_find_by_tid_locked(p, tid);
+    struct sched_task *target = thread_from_cap_locked(p, &cap_slot);
     if (!thread_target_is_live(target)) {
         proc_table_unlock_irqrestore(tflags);
         return -(i64) ESRCH;
@@ -2479,7 +2608,7 @@ static i64 sys_sigprocmask_h(struct trap_frame *tf, struct sched_task *td)
 /* PSE51 user threads.  PROC_THREAD_MAX bounds the per-process task
  * list; sched_create_user_thread allocates a new task in the calling
  * proc, runs it on its own per-thread stack inside the proc VA
- * window, and returns the kernel TID via td->id.  Lifecycle:
+ * window, and returns the CAP_TYPE_THREAD slot index. Lifecycle:
  *
  *   create  -> JOINABLE
  *   detach  -> DETACHED  (no one will join; auto-cleans on exit)
@@ -2513,23 +2642,7 @@ static i64 sys_thread_create_h(struct trap_frame *tf, struct sched_task *td)
                                       inherited_sigmask, &new_td);
     if (rc < 0)
         return (i64) rc;
-    return (i64) new_td->id;
-}
-
-/* Find the proc-attached thread with the given kernel TID. Caller
- * must hold proc_table_lock. Returns NULL if no such thread is
- * attached (it may have been detached and reaped already).
- */
-static struct sched_task *thread_find_by_tid_locked(struct proc *p, u16 tid)
-{
-    if (!p)
-        return NULL;
-    for (u8 i = 0; i < PROC_THREAD_MAX; i++) {
-        struct sched_task *t = p->tasks[i];
-        if (t && t->id == tid)
-            return t;
-    }
-    return NULL;
+    return cap_get_token(td->proc, new_td->td_cap_slot, CAP_TYPE_THREAD);
 }
 
 static bool thread_target_is_live(const struct sched_task *target)
@@ -2560,17 +2673,19 @@ static bool thread_claim_reap(struct sched_task *target)
                                        __ATOMIC_RELAXED);
 }
 
-static bool thread_join_wait_done_locked(struct proc *p, u16 tid)
+static bool thread_join_wait_done_locked(struct proc *p, u16 task_slot)
 {
-    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+    if (!p || task_slot >= PROC_THREAD_MAX)
+        return true;
+    struct sched_task *target = p->tasks[task_slot];
 
     return !target || target->td_join_state != TD_JOIN_JOINABLE;
 }
 
-static bool thread_join_wait_done(struct proc *p, u16 tid)
+static bool thread_join_wait_done(struct proc *p, u16 task_slot)
 {
     u64 flags = proc_table_lock_irqsave();
-    bool done = thread_join_wait_done_locked(p, tid);
+    bool done = thread_join_wait_done_locked(p, task_slot);
     proc_table_unlock_irqrestore(flags);
     return done;
 }
@@ -2579,13 +2694,16 @@ static i64 sys_thread_join_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
+    u64 handle = tf->a0;
     ptr u_exit_code = (ptr) tf->a1;
     struct proc *p = td->proc;
 
-    /* pthread_join(self) -> EDEADLK per POSIX. */
-    if (tid == td->id)
+    struct cap_slot_view thread_slot;
+    if (!thread_lookup_cap(p, handle, CAP_RIGHT_READ, &thread_slot))
+        return -(i64) ESRCH;
+    if (thread_slot.slot_index == (u8) td->td_cap_slot)
         return -(i64) EDEADLK;
+    u16 task_slot = thread_slot.object_index;
 
     for (;;) {
         struct sched_task *target = NULL;
@@ -2593,7 +2711,7 @@ static i64 sys_thread_join_h(struct trap_frame *tf, struct sched_task *td)
         i32 exit_code = 0;
 
         u64 pflags = proc_table_lock_irqsave();
-        target = thread_find_by_tid_locked(p, tid);
+        target = thread_from_cap_locked(p, &thread_slot);
         if (target) {
             join_state = (i32) __atomic_load_n((u8 *) &target->td_join_state,
                                                __ATOMIC_ACQUIRE);
@@ -2605,8 +2723,11 @@ static i64 sys_thread_join_h(struct trap_frame *tf, struct sched_task *td)
                 }
                 exit_code = target->td_exit_code;
                 if (thread_claim_reap(target)) {
-                    proc_reap_exited_thread_locked(p, target);
+                    i64 thread_token =
+                        proc_reap_exited_thread_locked(p, target);
                     proc_table_unlock_irqrestore(pflags);
+                    if (thread_token >= 0)
+                        (void) cap_drop_token(p, (u64) thread_token);
                     wake_up(&p->thread_event_wq, I32_MAX);
                     sched_reap_user_thread(target);
                     if (u_exit_code) {
@@ -2636,8 +2757,8 @@ static i64 sys_thread_join_h(struct trap_frame *tf, struct sched_task *td)
          * would let a concurrent free race this dereference.
          */
         enum wait_unblock_reason reason;
-        wait_event_reason(p->thread_event_wq, thread_join_wait_done(p, tid),
-                          reason);
+        wait_event_reason(p->thread_event_wq,
+                          thread_join_wait_done(p, task_slot), reason);
         if (wait_unblock_is_terminal(reason))
             return -(i64) EINTR;
         /* Loop back: re-take the locks and observe the new state. */
@@ -2648,11 +2769,15 @@ static i64 sys_thread_detach_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
+    u64 handle = tf->a0;
     struct proc *p = td->proc;
 
+    struct cap_slot_view thread_slot;
+    if (!thread_lookup_cap(p, handle, CAP_RIGHT_WRITE, &thread_slot))
+        return -(i64) ESRCH;
+
     u64 pflags = proc_table_lock_irqsave();
-    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+    struct sched_task *target = thread_from_cap_locked(p, &thread_slot);
     if (!target) {
         proc_table_unlock_irqrestore(pflags);
         return -(i64) ESRCH;
@@ -2668,8 +2793,9 @@ static i64 sys_thread_detach_h(struct trap_frame *tf, struct sched_task *td)
     bool claimed_reap = false;
     if (!claimed_join)
         claimed_reap = thread_claim_reap(target);
+    i64 thread_token = -(i64) EBADF;
     if (claimed_reap)
-        proc_reap_exited_thread_locked(p, target);
+        thread_token = proc_reap_exited_thread_locked(p, target);
     proc_table_unlock_irqrestore(pflags);
 
     if (claimed_join) {
@@ -2681,6 +2807,8 @@ static i64 sys_thread_detach_h(struct trap_frame *tf, struct sched_task *td)
         return 0;
     }
     if (claimed_reap) {
+        if (thread_token >= 0)
+            (void) cap_drop_token(p, (u64) thread_token);
         /* Target already exited; this caller wins the reap. */
         wake_up(&p->thread_event_wq, I32_MAX);
         sched_reap_user_thread(target);
@@ -2732,7 +2860,7 @@ static i64 sys_thread_self_h(struct trap_frame *tf __unused,
 {
     if (!td)
         return -(i64) EPERM;
-    return (i64) td->id;
+    return cap_get_token(td->proc, td->td_cap_slot, CAP_TYPE_THREAD);
 }
 
 /* pthread_cancel(tid): mark the target thread cancellation-pending.
@@ -2744,11 +2872,15 @@ static i64 sys_thread_cancel_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
+    u64 handle = tf->a0;
     struct proc *p = td->proc;
 
+    struct cap_slot_view thread_slot;
+    if (!thread_lookup_cap(p, handle, CAP_RIGHT_WRITE, &thread_slot))
+        return -(i64) ESRCH;
+
     u64 pflags = proc_table_lock_irqsave();
-    struct sched_task *target = thread_find_by_tid_locked(p, tid);
+    struct sched_task *target = thread_from_cap_locked(p, &thread_slot);
     bool target_live = thread_target_is_live(target);
     if (target_live)
         __atomic_store_n(&target->td_cancel_pending, true, __ATOMIC_RELAXED);
@@ -2813,7 +2945,7 @@ static i64 sys_thread_setschedparam_h(struct trap_frame *tf,
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
+    u64 handle = tf->a0;
     i32 new_prio = (i32) tf->a1;
 
     if (new_prio < SCHED_PRIO_IDLE || new_prio >= CONFIG_SCHED_NPRIO)
@@ -2822,9 +2954,17 @@ static i64 sys_thread_setschedparam_h(struct trap_frame *tf,
         return -(i64) EPERM;
 
     struct sched_task *target = td;
-    if (tid != 0 && tid != td->id) {
+    if (handle != 0) {
+        struct cap_slot_view thread_slot;
+        if (!thread_lookup_cap(td->proc, handle, CAP_RIGHT_WRITE, &thread_slot))
+            return -(i64) ESRCH;
+        if (thread_slot.slot_index == (u8) td->td_cap_slot) {
+            td->td_base_prio = (u8) new_prio;
+            pi_mutex_refresh_prio(td);
+            return 0;
+        }
         u64 pflags = proc_table_lock_irqsave();
-        target = thread_find_by_tid_locked(td->proc, tid);
+        target = thread_from_cap_locked(td->proc, &thread_slot);
         if (target) {
             target->td_base_prio = (u8) new_prio;
             pi_mutex_refresh_prio(target);
@@ -2844,12 +2984,17 @@ static i64 sys_thread_getschedparam_h(struct trap_frame *tf,
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    u16 tid = (u16) tf->a0;
-    if (tid == 0 || tid == td->id)
+    u64 handle = tf->a0;
+    if (handle == 0)
         return (i64) td->td_base_prio;
 
+    struct cap_slot_view thread_slot;
+    if (!thread_lookup_cap(td->proc, handle, CAP_RIGHT_READ, &thread_slot))
+        return -(i64) ESRCH;
+    if (thread_slot.slot_index == (u8) td->td_cap_slot)
+        return (i64) td->td_base_prio;
     u64 pflags = proc_table_lock_irqsave();
-    struct sched_task *target = thread_find_by_tid_locked(td->proc, tid);
+    struct sched_task *target = thread_from_cap_locked(td->proc, &thread_slot);
     i64 result = target ? (i64) target->td_base_prio : -(i64) ESRCH;
     proc_table_unlock_irqrestore(pflags);
     return result;
@@ -2931,7 +3076,16 @@ static i64 sys_timer_create_h(struct trap_frame *tf __unused,
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    return (i64) posix_timer_create(td->proc);
+    i32 object_index = posix_timer_alloc(td->proc);
+    if (object_index < 0)
+        return (i64) object_index;
+    i32 handle = cap_open_timer(td->proc, (u16) object_index,
+                                CAP_RIGHT_READ | CAP_RIGHT_WRITE, -1, false);
+    if (handle < 0) {
+        posix_timer_put_idx((u16) object_index);
+        return (i64) handle;
+    }
+    return (i64) handle;
 }
 
 static i64 sys_timer_settime_h(struct trap_frame *tf, struct sched_task *td)
@@ -2947,30 +3101,90 @@ static i64 sys_timer_settime_h(struct trap_frame *tf, struct sched_task *td)
      * proc up front so misconfigured timers fail at settime, not at
      * silent expiry.
      */
-    u16 target_tid = (u16) tf->a3;
-    return (i64) posix_timer_settime(handle, td->proc, value_ms, interval_ms,
-                                     target_tid);
+    u16 target_tid = 0;
+    if (tf->a3 != 0) {
+        struct cap_slot_view target_slot;
+        if (!thread_lookup_cap(td->proc, tf->a3, CAP_RIGHT_READ, &target_slot))
+            return -(i64) ESRCH;
+
+        u64 pflags = proc_table_lock_irqsave();
+        struct sched_task *target =
+            thread_from_cap_locked(td->proc, &target_slot);
+        bool live = thread_target_is_live(target);
+        if (live)
+            target_tid = target->id;
+        proc_table_unlock_irqrestore(pflags);
+        if (!live)
+            return -(i64) ESRCH;
+    }
+    struct cap_ref ref = cap_lookup_timer(td->proc, handle, CAP_RIGHT_WRITE);
+    if (!ref.ptr)
+        return -(i64) EINVAL;
+    i64 rc = (i64) posix_timer_settime_idx(ref.object_index, value_ms,
+                                           interval_ms, target_tid);
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_timer_delete_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    return (i64) posix_timer_delete((i32) tf->a0, td->proc);
+    i32 handle = (i32) tf->a0;
+    struct cap_slot_view slot = cap_slot_read(td->proc, handle);
+    if (!slot.valid || slot.type != CAP_TYPE_TIMER)
+        return -(i64) EINVAL;
+    return cap_drop_token(td->proc, cap_make_handle(&slot));
 }
 
 static i64 sys_timer_gettime_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    return (i64) posix_timer_gettime((i32) tf->a0, td->proc);
+    struct cap_ref ref =
+        cap_lookup_timer(td->proc, (i32) tf->a0, CAP_RIGHT_READ);
+    if (!ref.ptr)
+        return -(i64) EINVAL;
+    i64 rc = posix_timer_gettime_idx(ref.object_index);
+    cap_put_ref(&ref);
+    return rc;
 }
 
 static i64 sys_timer_getoverrun_h(struct trap_frame *tf, struct sched_task *td)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
-    return (i64) posix_timer_getoverrun((i32) tf->a0, td->proc);
+    struct cap_ref ref =
+        cap_lookup_timer(td->proc, (i32) tf->a0, CAP_RIGHT_READ);
+    if (!ref.ptr)
+        return -(i64) EINVAL;
+    i64 rc = posix_timer_getoverrun_idx(ref.object_index);
+    cap_put_ref(&ref);
+    return rc;
+}
+
+static i64 sys_cap_drop_h(struct trap_frame *tf, struct sched_task *td)
+{
+    return cap_drop_token(td->proc, tf->a0);
+}
+
+static i64 sys_cap_transfer_h(struct trap_frame *tf, struct sched_task *td)
+{
+    i64 raw_pid = (i64) tf->a0;
+    if (raw_pid <= 0 || raw_pid > (i64) U16_MAX)
+        return -(i64) EINVAL;
+    return cap_transfer(td->proc, (u16) raw_pid, tf->a1, (u8) tf->a2);
+}
+
+static i64 sys_cap_revoke_delegate_h(struct trap_frame *tf,
+                                     struct sched_task *td)
+{
+    return cap_revoke_delegate(td->proc, tf->a0);
+}
+
+static i64 sys_cap_get_token_h(struct trap_frame *tf, struct sched_task *td)
+{
+    return cap_get_token(td->proc, (i32) tf->a0, (u8) tf->a1);
 }
 
 typedef i64 (*syscall_fn_t)(struct trap_frame *tf, struct sched_task *td);
@@ -3106,6 +3320,11 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_TIMER_DELETE] = {sys_timer_delete_h, SYSCALL_F_NEEDS_PROC},
     [SYS_TIMER_GETTIME] = {sys_timer_gettime_h, SYSCALL_F_NEEDS_PROC},
     [SYS_TIMER_GETOVERRUN] = {sys_timer_getoverrun_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_CAP_DROP] = {sys_cap_drop_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_CAP_TRANSFER] = {sys_cap_transfer_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_CAP_REVOKE_DELEGATE] = {sys_cap_revoke_delegate_h,
+                                 SYSCALL_F_NEEDS_PROC},
+    [SYS_CAP_GET_TOKEN] = {sys_cap_get_token_h, SYSCALL_F_NEEDS_PROC},
 };
 
 /* Security counters, global and irq-safe via atomics. */

@@ -298,6 +298,7 @@ struct sched_task {
     i32 td_exit_code;
     struct wait_queue_head td_join_wq;
     bool td_exit_started;
+    i16 td_cap_slot;
 
     /* PSE51 cancellation state (pthread_cancel / _setcancelstate /
      * _setcanceltype / _testcancel).  td_cancel_pending is set by

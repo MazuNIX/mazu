@@ -469,7 +469,7 @@ struct result_sz ram_fs_write(struct ram_fs_node *rfs_node,
         return result_sz_error(EROFS);
 
     /* Files are initialized to contain some data when created. */
-    assert(rfs_node->data.dat != NULL && rfs_node->data.cap != 0);
+    assert(rfs_node->data.dat && rfs_node->data.cap != 0);
 
     /* An offset outside of the file doesn't make sense. If the offset is equal
      * to the file length, the write operation appends to the file.
@@ -690,10 +690,11 @@ static struct result_vfs_stat ramfs_vfs_stat(void *ctx, struct str path)
         return result_vfs_stat_error(res.code);
 
     struct ram_fs_node *node = result_ram_fs_node_checked(res);
+    bool is_file = node->type == RAM_FS_TYPE_FILE;
     struct vfs_stat st = {
-        .size = (node->type == RAM_FS_TYPE_FILE) ? node->data.len : 0,
-        .type = (node->type == RAM_FS_TYPE_FILE) ? VFS_TYPE_FILE : VFS_TYPE_DIR,
-        .flags = 0,
+        .size = is_file ? node->data.len : 0,
+        .type = is_file ? VFS_TYPE_FILE : VFS_TYPE_DIR,
+        .flags = is_file ? 0 : VFS_FLAG_NOSEEK,
         .etag = node->etag,
     };
     return result_vfs_stat_ok(st);

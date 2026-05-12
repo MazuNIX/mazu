@@ -9,7 +9,7 @@ static i32 selftest_uaccess_validation(void)
     char dst[16] = {0};
     const vaddr_t test_page = USER_DATA_BASE + (128UL * PAGE_SIZE);
     struct proc *p = proc_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(
         proc_map_user_page(p, test_page, PT_FLAG_RW | PT_FLAG_USER).is_error ==
         false);

@@ -2,89 +2,72 @@
 /* posix_spawn file actions and spawn attributes.
  *
  * Executes file actions (open/close/dup2) in the child's FD table before
- * the child is enqueued.  All mutations hold the child's fd_lock.
- * The child is in EMBRYO state during this phase - not yet visible to
+ * the child is enqueued. The child already holds its inherited parent FD
+ * snapshot at this point, so ordered mutations are resolved entirely against
+ * the child-local table. All mutations hold the child's fd_lock. The child
+ * is in EMBRYO state during this phase - not yet visible to
  * other tasks or harts.
  */
 
+#include <mazu/cap.h>
 #include <mazu/proc.h>
 #include <mazu/sched.h>
 #include <mazu/spawn.h>
 #include <mazu/string.h>
 #include <mazu/vfs.h>
 
-#include "pipe.h"
-
-/* Open a file and install it at a specific FD in the child's table.
- * Caller must hold child->fd_lock.
- */
-static i32 fa_open_locked(struct proc *child, i32 fd, char *kpath, sz pathlen)
+static i32 fa_open(struct proc *child, i32 fd, char *kpath, sz pathlen)
 {
     if (fd < 0 || fd >= PROC_FD_MAX)
         return -(i32) EBADF;
 
     struct str path = str_new(kpath, pathlen);
+    struct result_vfs_stat st = vfs_stat(path);
+    if (st.is_error)
+        return -(i32) st.code;
+    struct vfs_stat vstat = result_vfs_stat_checked(st);
+    /* Permit GRANT on supervisor-opened FDs explicitly flagged for delegation.
+     * SPAWN_FA_OPEN is exactly that path: the parent is configuring the child's
+     * FD table at spawn time, so the minted cap carries GRANT and preserves the
+     * normal spawn inheritance semantics. Plain sys_open still mints a
+     * non-delegable cap.
+     */
+    u8 rights = CAP_RIGHT_READ | CAP_RIGHT_GRANT;
+    if ((vstat.flags & VFS_FLAG_RDONLY) == 0)
+        rights |= CAP_RIGHT_WRITE;
+    bool is_seekable = (vstat.flags & VFS_FLAG_NOSEEK) == 0;
+
     struct result_vfs_file fres = vfs_open(path);
     if (fres.is_error)
         return -(i32) fres.code;
-
-    /* Close existing FD if occupied. */
-    if (child->fd_table[fd].is_open)
-        proc_close_fd_locked(child, fd);
-
-    child->fd_table[fd].is_open = true;
-    child->fd_table[fd].is_seekable = true;
-    child->fd_table[fd].is_dup = false;
-    child->fd_table[fd].offset = 0;
-    child->fd_table[fd].file = result_vfs_file_checked(fres);
-    return 0;
+    i32 rc = cap_open_vfs(child, result_vfs_file_checked(fres), rights,
+                          is_seekable, fd, true);
+    return rc < 0 ? rc : 0;
 }
 
-/* Close a specific FD in the child's table.
- * Caller must hold child->fd_lock.
- */
-static i32 fa_close_locked(struct proc *child, i32 fd)
+static i32 fa_close(struct proc *child, i32 fd)
 {
     if (fd < 0 || fd >= PROC_FD_MAX)
         return -(i32) EBADF;
-
-    if (child->fd_table[fd].is_open)
-        proc_close_fd_locked(child, fd);
-    return 0;
+    /* POSIX posix_spawn_file_actions_addclose ignores already-closed FDs. */
+    i64 rc = cap_close_fd(child, fd);
+    return rc == -(i64) EBADF ? 0 : (i32) rc;
 }
 
-/* Duplicate oldfd to newfd in the child's table.
- * Caller must hold child->fd_lock.
- */
-static i32 fa_dup2_locked(struct proc *child, i32 oldfd, i32 newfd)
+static i32 fa_dup2(struct proc *child, i32 oldfd, i32 newfd)
 {
     if (oldfd < 0 || oldfd >= PROC_FD_MAX)
         return -(i32) EBADF;
     if (newfd < 0 || newfd >= PROC_FD_MAX)
         return -(i32) EBADF;
-    if (!child->fd_table[oldfd].is_open)
-        return -(i32) EBADF;
 
-    if (oldfd == newfd)
-        return 0;
-
-    if (child->fd_table[newfd].is_open)
-        proc_close_fd_locked(child, newfd);
-
-    child->fd_table[newfd] = child->fd_table[oldfd];
-    child->fd_table[newfd].is_dup = true;
-
-    if (child->fd_table[newfd].is_pipe) {
-        u64 pf = spin_lock_irqsave(&child->fd_table[newfd].pipe->lock);
-        if (child->fd_table[newfd].pipe_read_end)
-            child->fd_table[newfd].pipe->readers++;
-        else
-            child->fd_table[newfd].pipe->writers++;
-        spin_unlock_irqrestore(&child->fd_table[newfd].pipe->lock, pf);
-    }
-    return 0;
+    i32 rc = cap_dup_fd(child, oldfd, newfd, true);
+    return rc < 0 ? rc : 0;
 }
 
+/* Actions execute in caller order, matching posix_spawn semantics, against
+ * the child's already-inherited FD table.
+ */
 i32 spawn_apply_file_actions(struct proc *child,
                              const struct spawn_file_action *actions,
                              sz count)
@@ -94,38 +77,49 @@ i32 spawn_apply_file_actions(struct proc *child,
     if (count > SPAWN_FA_MAX)
         return -(i32) EINVAL;
 
-    i32 rc = 0;
-    u64 fd_flags = proc_fd_lock_irqsave(child);
+    /* Validate all entries up front so a malformed action late in the
+     * list fails before any side effect lands on the child.
+     */
+    for (sz i = 0; i < count; i++) {
+        const struct spawn_file_action *fa = &actions[i];
+        switch (fa->type) {
+        case SPAWN_FA_OPEN:
+            if (fa->pathlen == 0 || fa->pathlen > SPAWN_FA_PATH_MAX)
+                return -(i32) EINVAL;
+            break;
+        case SPAWN_FA_CLOSE:
+        case SPAWN_FA_DUP2:
+            break;
+        default:
+            return -(i32) EINVAL;
+        }
+    }
 
     for (sz i = 0; i < count; i++) {
         const struct spawn_file_action *fa = &actions[i];
-
+        i32 rc = 0;
         switch (fa->type) {
-        case SPAWN_FA_OPEN:
-            if (fa->pathlen == 0 || fa->pathlen > SPAWN_FA_PATH_MAX) {
-                rc = -(i32) EINVAL;
-                goto out;
-            }
-            rc = fa_open_locked(child, fa->fd, (char *) fa->path, fa->pathlen);
-            break;
         case SPAWN_FA_CLOSE:
-            rc = fa_close_locked(child, fa->fd);
+            rc = fa_close(child, fa->fd);
+            if (rc < 0)
+                return rc;
+            break;
+        case SPAWN_FA_OPEN:
+            rc = fa_open(child, fa->fd, (char *) fa->path, fa->pathlen);
+            if (rc < 0)
+                return rc;
             break;
         case SPAWN_FA_DUP2:
-            rc = fa_dup2_locked(child, fa->fd, fa->newfd);
+            rc = fa_dup2(child, fa->fd, fa->newfd);
+            if (rc < 0)
+                return rc;
             break;
         default:
-            rc = -(i32) EINVAL;
-            goto out;
+            return -(i32) EINVAL;
         }
-
-        if (rc < 0)
-            goto out;
     }
 
-out:
-    proc_fd_unlock_irqrestore(child, fd_flags);
-    return rc;
+    return 0;
 }
 
 i32 spawn_apply_attr(struct proc *child __unused,

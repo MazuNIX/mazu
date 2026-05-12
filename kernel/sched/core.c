@@ -2,6 +2,7 @@
 #include <mazu/asm.h>
 #include <mazu/assert.h>
 #include <mazu/callout.h>
+#include <mazu/cap.h>
 #include <mazu/cpumask.h>
 #include <mazu/eventlog.h>
 #include <mazu/init.h>
@@ -1132,6 +1133,7 @@ static struct sched_task *sched_task_alloc_init(void)
     task->td_exit_code = 0;
     init_waitqueue_head(&task->td_join_wq);
     task->td_exit_started = false;
+    task->td_cap_slot = -1;
 
 #if CONFIG_SCHED_DEADLINE
     sched_dl_task_init(task);
@@ -1242,6 +1244,11 @@ static vaddr_t user_thread_stack_top(struct proc *p, u8 idx)
                       (u64) idx * (USER_STACK_SIZE + PAGE_SIZE));
 }
 
+static inline i32 user_thread_cap_slot(u8 task_slot)
+{
+    return CAP_SPACE_SLOTS - PROC_THREAD_MAX + (i32) task_slot;
+}
+
 static void rollback_user_thread_stack(struct proc *p,
                                        ptr stack_bottom,
                                        vaddr_t stack_top_va)
@@ -1321,6 +1328,23 @@ struct result sched_create_user_task(struct proc *p, ptr entry, u8 prio)
             return result_error(EAGAIN);
         }
     }
+
+    u8 thread_slot = proc_task_slot(p, task);
+    i32 thread_handle = cap_open_handle(
+        p, thread_slot, CAP_TYPE_THREAD, CAP_RIGHT_READ | CAP_RIGHT_WRITE,
+        user_thread_cap_slot(thread_slot), true);
+    if (thread_handle < 0) {
+        u64 pflags = proc_table_lock_irqsave();
+        i64 token = proc_reap_exited_thread_locked(p, task);
+        proc_table_unlock_irqrestore(pflags);
+        if (token >= 0)
+            (void) cap_drop_token(p, (u64) token);
+        paging_map_page((vaddr_t) task->guard, (paddr_t) task->guard,
+                        PT_FLAG_RW);
+        kvalloc_free(byte_array_new((void *) task, sizeof(*task)));
+        return result_error((u16) (-thread_handle));
+    }
+    task->td_cap_slot = (i16) thread_handle;
 
     sched_task_enqueue(task, prio);
 
@@ -1432,6 +1456,22 @@ i32 sched_create_user_thread(struct proc *p,
             return -(i32) EAGAIN;
         }
     }
+
+    i32 thread_handle = cap_open_handle(p, slot, CAP_TYPE_THREAD,
+                                        CAP_RIGHT_READ | CAP_RIGHT_WRITE,
+                                        user_thread_cap_slot(slot), true);
+    if (thread_handle < 0) {
+        u64 pflags = proc_table_lock_irqsave();
+        i64 token = proc_reap_exited_thread_locked(p, task);
+        proc_table_unlock_irqrestore(pflags);
+        if (token >= 0)
+            (void) cap_drop_token(p, (u64) token);
+        paging_map_page((vaddr_t) task->guard, (paddr_t) task->guard,
+                        PT_FLAG_RW);
+        kvalloc_free(byte_array_new((void *) task, sizeof(*task)));
+        return thread_handle;
+    }
+    task->td_cap_slot = (i16) thread_handle;
 
     sched_task_enqueue(task, prio);
     *out_td = task;

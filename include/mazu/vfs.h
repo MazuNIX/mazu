@@ -17,6 +17,11 @@
 #define VFS_TYPE_FILE 0
 #define VFS_TYPE_DIR 1
 #define VFS_FLAG_RDONLY BIT(0)
+/* Backend nodes whose read/write semantics are stream-like rather than
+ * positional. Set on synthetic /dev, /proc, /net entries and on real
+ * directories. lseek on a NOSEEK descriptor returns ESPIPE.
+ */
+#define VFS_FLAG_NOSEEK BIT(1)
 #define VFS_MAX_MOUNTS 8
 
 struct vfs_stat {
@@ -124,7 +129,7 @@ static inline struct vfs_stat vfs_rdonly_dir_stat(void)
     return (struct vfs_stat) {
         .size = 0,
         .type = VFS_TYPE_DIR,
-        .flags = VFS_FLAG_RDONLY,
+        .flags = VFS_FLAG_RDONLY | VFS_FLAG_NOSEEK,
         .etag = 0,
     };
 }
@@ -134,7 +139,7 @@ static inline struct vfs_stat vfs_rdonly_file_stat(void)
     return (struct vfs_stat) {
         .size = 0,
         .type = VFS_TYPE_FILE,
-        .flags = VFS_FLAG_RDONLY,
+        .flags = VFS_FLAG_RDONLY | VFS_FLAG_NOSEEK,
         .etag = 0,
     };
 }

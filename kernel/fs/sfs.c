@@ -659,10 +659,11 @@ static struct result_vfs_stat sfs_vfs_stat(void *ctx, struct str path)
     if (!d)
         return result_vfs_stat_error(EIO);
 
+    bool is_dir = d->type == SFS_TYPE_DIR;
     struct vfs_stat st = {
         .size = d->size,
-        .type = (d->type == SFS_TYPE_DIR) ? VFS_TYPE_DIR : VFS_TYPE_FILE,
-        .flags = 0,
+        .type = is_dir ? VFS_TYPE_DIR : VFS_TYPE_FILE,
+        .flags = is_dir ? VFS_FLAG_NOSEEK : 0,
         .etag = 0,
     };
     bcache_release(db);

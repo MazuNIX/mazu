@@ -132,67 +132,70 @@
  */
 #define SYS_SIGPROCMASK 84
 
-/* Per-thread scheduling parameters (pthread_setschedparam /
- * pthread_getschedparam).  Take a kernel TID (0 = self) and a scalar
- * priority.  SYS_SCHED_SETPARAM / _GETPARAM continue to operate on
- * the calling thread only; these add the by-TID form.
+/* Per-thread scheduling parameters
+ * (pthread_{setschedparam,pthread_getschedparam}). Take a CAP_TYPE_THREAD
+ * handle (0 = self) and a scalar priority. SYS_SCHED_{SETPARAM,GETPARAM}
+ * continue to operate on the calling thread only; these add the by-handle form.
  */
 #define SYS_THREAD_SETSCHEDPARAM 85
 #define SYS_THREAD_GETSCHEDPARAM 86
 
-/* POSIX scheduler-policy accessors (sched_setscheduler /
- * sched_getscheduler). Mazu honors SCHED_FIFO semantics for all
- * normal threads; SCHED_OTHER and SCHED_RR are accepted but
- * coerced to FIFO. SCHED_DEADLINE is rejected here because it has
- * its own ABI via SYS_SCHED_SETATTR.
+/* POSIX scheduler-policy accessors (sched_{setscheduler,getscheduler}). Mazu
+ * honors SCHED_FIFO semantics for all normal threads; SCHED_OTHER and SCHED_RR
+ * are accepted but coerced to FIFO. SCHED_DEADLINE is rejected here because it
+ * has its own ABI via SYS_SCHED_SETATTR.
  */
 #define SYS_SCHED_SETSCHEDULER 87
 #define SYS_SCHED_GETSCHEDULER 88
 
 /* PSE51 thread-directed signal API.
  *
- * SYS_PTHREAD_KILL: deliver signo directly to the thread with the
- * given kernel TID inside the calling proc.  Different from SYS_KILL
- * which is process-directed.
+ * SYS_PTHREAD_KILL: deliver signo directly to the thread named by the given
+ * CAP_TYPE_THREAD handle inside the calling proc. Different from SYS_KILL which
+ * is process-directed.
  *
- * SYS_PTHREAD_SIGMASK: identical wire shape to SYS_SIGPROCMASK
- * (operates on the calling thread's td_sig.blocked) but exposes the
- * pthread_sigmask name for ABI clarity. Userspace libc maps
- * pthread_sigmask -> this; sigprocmask -> SYS_SIGPROCMASK.
+ * SYS_PTHREAD_SIGMASK: identical wire shape to SYS_SIGPROCMASK (operates on the
+ * calling thread's td_sig.blocked) but exposes the pthread_sigmask name for ABI
+ * clarity.
+ * Userspace libc maps pthread_sigmask -> this; sigprocmask -> SYS_SIGPROCMASK.
  */
 #define SYS_PTHREAD_KILL 89
 #define SYS_PTHREAD_SIGMASK 90
 
-/* PSE51 wait-for-signal variants. sigsuspend replaces the calling
- * thread's blocked mask with the supplied set, blocks until any
- * signal arrives that is not in the new mask, then restores the old
- * mask. sigtimedwait blocks until a signal in the supplied set
- * becomes pending or the timeout expires, then dequeues the signal
- * (without invoking its handler) and returns its number. sigwait
- * is the no-timeout variant, expressed by passing a NULL timeout.
+/* PSE51 wait-for-signal variants. sigsuspend replaces the calling thread's
+ * blocked mask with the supplied set, blocks until any signal arrives that is
+ * not in the new mask, then restores the old mask. sigtimedwait blocks until
+ * a signal in the supplied set becomes pending or the timeout expires, then
+ * dequeues the signal (without invoking its handler) and returns its number.
+ * sigwait is the no-timeout variant, expressed by passing a NULL timeout.
  */
 #define SYS_SIGSUSPEND 91
 #define SYS_SIGTIMEDWAIT 92
 
-/* PSE51 thread cancellation (pthread_cancel / _setcancelstate /
- * _setcanceltype / _testcancel).  Cancellation is deferred: a
- * thread observes the pending bit at the next cancellation point
- * (any blocking syscall checks signal_pending_current /
- * thread_cancel_pending before entering the wait) and exits with
- * code -ECANCELED.
+/* PSE51 thread cancellation
+ * (pthread_{cancel,setcancelstate,setcanceltype,testcancel}). Cancellation is
+ * deferred: a thread observes the pending bit at the next cancellation point
+ * (any blocking syscall checks signal_pending_current / thread_cancel_pending
+ * before entering the wait) and exits with code -ECANCELED.
  */
 #define SYS_THREAD_CANCEL 93
 #define SYS_THREAD_SETCANCELSTATE 94
 #define SYS_THREAD_TESTCANCEL 95
 
-#define SYS_NR 96 /* total number of syscalls */
+/* Capability management. */
+#define SYS_CAP_DROP 96
+#define SYS_CAP_TRANSFER 97
+#define SYS_CAP_REVOKE_DELEGATE 98
+#define SYS_CAP_GET_TOKEN 99
+
+#define SYS_NR 100 /* total number of syscalls */
 
 /* pthread_setcancelstate state values. */
 #define PTHREAD_CANCEL_ENABLE 0
 #define PTHREAD_CANCEL_DISABLE 1
 
-/* POSIX scheduling policies (subset). SCHED_FIFO is the only policy
- * Mazu honors directly; SCHED_OTHER and SCHED_RR map onto it.
+/* POSIX scheduling policies (subset). SCHED_FIFO is the only policy Mazu honors
+ * directly; SCHED_OTHER and SCHED_RR map onto it.
  */
 #define SCHED_OTHER 0
 #define SCHED_FIFO 1

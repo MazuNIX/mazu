@@ -18,7 +18,7 @@ static bool pipe_mem_eq(const void *a, const void *b, sz n)
 static i32 selftest_pipe_alloc(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->readers == 1);
     assert(p->writers == 1);
     assert(pipe_used(p) == 0);
@@ -33,7 +33,7 @@ DEFINE_SELFTEST(pipe_alloc, selftest_pipe_alloc);
 static i32 selftest_pipe_write_read(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     const char msg[] = "hello pipe";
     i64 written = pipe_write(p, msg, sizeof(msg));
@@ -54,7 +54,7 @@ DEFINE_SELFTEST(pipe_write_read, selftest_pipe_write_read);
 static i32 selftest_pipe_eof(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Write some data first. */
     const char msg[] = "data";
@@ -83,7 +83,7 @@ DEFINE_SELFTEST(pipe_eof, selftest_pipe_eof);
 static i32 selftest_pipe_epipe(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     pipe_close_read(p);
 
@@ -100,7 +100,7 @@ DEFINE_SELFTEST(pipe_epipe, selftest_pipe_epipe);
 static i32 selftest_pipe_full(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Fill the pipe completely. */
     u8 wbuf[256];
@@ -141,7 +141,7 @@ DEFINE_SELFTEST(pipe_full, selftest_pipe_full);
 static i32 selftest_pipe_multi_write(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Three writes. */
     i64 w1 = pipe_write(p, "AAA", 3);
@@ -167,7 +167,7 @@ DEFINE_SELFTEST(pipe_multi_write, selftest_pipe_multi_write);
 static i32 selftest_pipe_zero_len(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     char buf[4];
     i64 r = pipe_read(p, buf, 0);
@@ -183,22 +183,16 @@ DEFINE_SELFTEST(pipe_zero_len, selftest_pipe_zero_len);
 static i32 selftest_pipe_fd_install(void)
 {
     struct proc *pr = proc_alloc();
-    assert(pr != NULL);
+    assert(pr);
 
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Install read end at FD 3, write end at FD 4. */
-    u64 fd_flags = proc_fd_lock_irqsave(pr);
-    pr->fd_table[3].is_open = true;
-    pr->fd_table[3].is_pipe = true;
-    pr->fd_table[3].pipe_read_end = true;
-    pr->fd_table[3].pipe = p;
-    pr->fd_table[4].is_open = true;
-    pr->fd_table[4].is_pipe = true;
-    pr->fd_table[4].pipe_read_end = false;
-    pr->fd_table[4].pipe = p;
-    proc_fd_unlock_irqrestore(pr, fd_flags);
+    assert(cap_open_pipe(pr, p, true, CAP_RIGHT_READ | CAP_RIGHT_GRANT, 3,
+                         true) == 3);
+    assert(cap_open_pipe(pr, p, false, CAP_RIGHT_WRITE | CAP_RIGHT_GRANT, 4,
+                         true) == 4);
 
     /* Write via pipe, read via pipe. */
     const char msg[] = "fd-test";
@@ -223,7 +217,7 @@ DEFINE_SELFTEST(pipe_fd_install, selftest_pipe_fd_install);
 static i32 selftest_pipe_wraparound(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
 
     /* Fill 3/4 of the buffer, read it all, then write again to wrap. */
     u8 fill[256];
@@ -286,7 +280,7 @@ DEFINE_SELFTEST(pipe_wraparound, selftest_pipe_wraparound);
 static i32 selftest_pipe_dup_refcount(void)
 {
     struct pipe *p = pipe_alloc();
-    assert(p != NULL);
+    assert(p);
     assert(p->readers == 1);
     assert(p->writers == 1);
 
