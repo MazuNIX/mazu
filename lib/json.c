@@ -229,6 +229,16 @@ static bool jp_match(struct json_parser *p, const char *s, sz len)
 
 #define JSON_CONTAINER_MAX 64
 
+/* Bound the per-container element count so that 'count * sizeof(element)'
+ * is provably representable in 'sz' and cannot wrap. Callers further down
+ * pass 'count' to arena_alloc_array() and memcpy(); without this compile
+ * time bound the multiplication would need a runtime overflow guard.
+ */
+static_assert(JSON_CONTAINER_MAX <= SZ_MAX / sizeof(struct json_value),
+              "JSON_CONTAINER_MAX too large for json_value allocation");
+static_assert(JSON_CONTAINER_MAX <= SZ_MAX / sizeof(struct json_kv),
+              "JSON_CONTAINER_MAX too large for json_kv allocation");
+
 static struct json_result jp_parse_array(struct json_parser *p)
 {
     if (p->depth >= JSON_MAX_DEPTH)
