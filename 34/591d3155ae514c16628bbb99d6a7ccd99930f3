@@ -1,0 +1,27 @@
+include/mazu/net/tcp.h
+  s_a0f5c92989d43c::t_f664cadb8a7646 68-71
+lib/json.c
+  s_a0f5c92989d43c::t_42dfa40782a101 181-185
+docs/security.md
+  s_a0f5c92989d43c::t_459cdf1f782477 27-29
+kernel/proc/cap.c
+  s_a0f5c92989d43c::t_88294e764657f6 6-9
+docs/internals.md
+  s_a0f5c92989d43c::t_85bd9b6b2f07ec 188-189,192-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "34591d3155ae514c16628bbb99d6a7ccd99930f3",
+  "prompts": {},
+  "sessions": {
+    "s_a0f5c92989d43c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "082072d2-88a6-4abb-a1b1-25e4690eda87",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
