@@ -1,0 +1,42 @@
+include/mazu/errordef.h
+  s_da81e63accb9eb::t_b5a83d444c017d 203-204
+  s_da81e63accb9eb::t_7a4e865e67ab40 116
+docs/pse51-matrix.md
+  s_da81e63accb9eb::t_c0e9d8c38e1f6a 19-21
+  s_da81e63accb9eb::t_b3ca3f7e852a23 38-40,45
+  s_da81e63accb9eb::t_df9233e55b73db 267-268
+include/mazu/pthread.h
+  s_da81e63accb9eb::t_f4e3b6fd56a043 268
+  s_da81e63accb9eb::t_4a343575341169 242-243,267
+  s_da81e63accb9eb::t_5b60875e829361 26-30,92-93,98-100
+  s_da81e63accb9eb::t_6e855aecc58c77 1-20,31-66,70,73-91,94-97,101-214,222,224-236,262-266,269-272
+  s_da81e63accb9eb::t_fa47b791c7d4d6 215-221,223
+  s_da81e63accb9eb::t_43b3ffb5de89a7 67-69,71
+kernel/proc/syscall.c
+  s_da81e63accb9eb::t_5caf7d45907b4a 2683-2685,2707
+  s_da81e63accb9eb::t_d3a3d92fac65ff 2680,2692-2696
+  s_da81e63accb9eb::t_43b3ffb5de89a7 2679
+tests/tests-pse51.c
+  s_da81e63accb9eb::t_4a343575341169 476-477,509-510,520-521
+  s_da81e63accb9eb::t_e1d68731c33e3e 389-410,413,416-470,478-483,489,492-493,497-508,512,535-607,610
+  s_da81e63accb9eb::t_1065caeac8eddb 523-527,532-533
+  s_da81e63accb9eb::t_72754264f04842 484-488,494-496,528-529
+  s_da81e63accb9eb::t_43b3ffb5de89a7 411-412,414-415,474-475,490-491,517-518,530,608-609
+  s_da81e63accb9eb::t_624db6b1fbb117 18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "6b5ed23a72814bdb862c459addfddc66a1188979",
+  "prompts": {},
+  "sessions": {
+    "s_da81e63accb9eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ffc23d0e-8902-4604-a194-97e8f4d60c50",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
