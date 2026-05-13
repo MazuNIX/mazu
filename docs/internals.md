@@ -185,13 +185,12 @@ by whichever is smaller: available data or destination capacity. The
 return value is the byte count copied; `0` means no data is available.
 
 The TCP subsystem also supports outbound (active open) connections via
-`tcp_conn_connect`. This allocates an ephemeral port (49152-65535), sends
-a SYN, and returns a handle in SYN_SENT state. The caller polls
+`tcp_conn_connect`. This allocates an ephemeral port (49152-65535),
+sends a SYN, and returns a handle in SYN_SENT state. The caller polls
 `tcp_conn_is_connected` until the three-way handshake completes (or
 `tcp_conn_is_reset` to detect failure). Once connected, `tcp_conn_send`
-and `tcp_conn_recv` work identically to server-side connections. This
-enables the kernel to make outbound HTTP requests, which is required for
-the AI assistant use case.
+and `tcp_conn_recv` work identically to server-side connections; the
+kernel can therefore originate HTTP requests as well as serve them.
 
 A note on the peer-closed flag: the Berkeley Sockets API returns `-EOF`
 from `read(2)` when a connection closes, packing error codes into the

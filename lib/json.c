@@ -178,9 +178,11 @@ static struct json_result jp_parse_number(struct json_parser *p)
         }
     }
 
-    /* Exponent part: consumed for well-formedness but not applied to the
-     * value.  Scientific notation (e.g. 1.2e3) is parsed as 1.2.  This is
-     * sufficient for LLM API responses (temperatures, token counts).
+    /* Exponent part: consumed for well-formedness but not applied to
+     * the value.  Scientific notation (e.g. 1.2e3) is parsed as 1.2.
+     * Current callers only need bounded fixed-precision decimals;
+     * if an exponent-aware consumer appears later, this is the place
+     * to fold the exponent into int_part/frac_scaled.
      */
     if (!jp_eof(p) && (jp_peek(p) == 'e' || jp_peek(p) == 'E')) {
         is_float = true;

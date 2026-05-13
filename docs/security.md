@@ -24,11 +24,9 @@ remote.
    for. Restrict access at the firewall or via the TAP interface to
    limit exposure.
 
-Adding a TLS library (e.g., BearSSL, ~45 KB) directly to the kernel is
-an option if standalone deployment is required, but conflicts with the
-compact-kernel goal. A host-side TLS relay proxy (`tools/tls_relay.py`)
-is provided for development: it accepts plaintext HTTP from the guest
-and forwards to upstream HTTPS APIs.
+Adding a TLS library (e.g., BearSSL, ~45 KB) directly to the kernel
+is an option if standalone deployment is required, but conflicts
+with the compact-kernel goal.
 
 ## Syscall authorization
 

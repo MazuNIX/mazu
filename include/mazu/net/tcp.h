@@ -65,9 +65,10 @@ struct result tcp_handle_packet(struct tcp_ip_pseudo_header pseudo_hdr,
 
 struct tcp_conn; /* opaque */
 
-/* Per-connection event notification hooks (P2.9q).
- * Kernel-internal only - used by in-kernel HTTP server, AI assistant task,
- * and /net synthetic filesystem.  NULL callbacks are skipped.
+/* Per-connection event notification hooks.
+ * Kernel-internal only; consumed by the in-kernel HTTP server, the /net
+ * synthetic filesystem, and any other task that needs out-of-band event
+ * delivery.  NULL callbacks are skipped.
  * Callbacks are invoked while tcp_pool_lock is held. The hook pointer itself
  * is snapshotted under conn->lock so tcp_conn_set_notify() does not contend on
  * the global TCP lock. Keep callbacks short and do not call back into any

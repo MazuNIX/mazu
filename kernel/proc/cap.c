@@ -3,10 +3,10 @@
  *
  * Object-bearing syscalls (FD, timer, sync primitives, message queue) gate
  * on per-process unforgeable handles instead of relying solely on the
- * coarse syscall allow-list. The least-privilege story matters for the
- * embedded AI-assistant workload: a sandboxed task can hold a cap to one
- * pipe end without thereby gaining access to every other FD the supervisor
- * owns. The cap layer composes with the existing dispatch-layer allow-list
+ * coarse syscall allow-list. The least-privilege story matters for any
+ * sandboxed workload: a confined task can hold a cap to one pipe end
+ * without thereby gaining access to every other FD the supervisor owns.
+ * The cap layer composes with the existing dispatch-layer allow-list
  * (the cheap two-load bit test still runs first; cap_lookup_* is the
  * second-stage object gate).
  *

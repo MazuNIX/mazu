@@ -89,12 +89,6 @@ Mazu-specific ABI shape rather than the exact POSIX shape, is tracked in
 - QEMU `virt` machine: virtio-mmio devices, PLIC, OpenSBI, Sv39 paging
   (identity-mapped, 2 MiB superpages with on-demand shattering).
 
-A planned use case is running an embedded AI assistant (similar to
-[MimiClaw](https://github.com/memovai/mimiclaw)) directly on the kernel.
-This requires outbound TCP client connections, TLS or a proxy relay
-strategy, JSON request/response parsing, streaming responses (SSE or
-WebSocket), and persistent state management.
-
 ## Quick start
 
 Primary development target is QEMU on Linux with standard tooling
