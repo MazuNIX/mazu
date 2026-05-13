@@ -113,6 +113,7 @@ static inline struct result result_ok(void)
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
 #define ECANCELED 125 /* operation canceled (POSIX, pthread_cancel) */
+#define ENOTSUP 95    /* operation not supported (POSIX) */
 
 static inline struct str error_code_str(u16 code)
 {
@@ -199,6 +200,8 @@ static inline struct str error_code_str(u16 code)
         return STR("No route to host (EHOSTUNREACH)");
     case ECANCELED:
         return STR("Operation canceled (ECANCELED)");
+    case ENOTSUP:
+        return STR("Operation not supported (ENOTSUP)");
     default:
         return STR("Unknown error");
     }
