@@ -1,0 +1,84 @@
+kernel/sync/condvar.c
+  s_98b7c727368abe::t_114f8f53288751 131-137
+kernel/proc/syscall.c
+  s_98b7c727368abe::t_1ebdb9968da119 1376-1383
+  s_98b7c727368abe::t_08b0370b917693 1780-1786
+  s_98b7c727368abe::t_d56c8e32d2934f 1830-1895
+  s_98b7c727368abe::t_35b48b46b61324 2452,2462,2468-2471,2475-2478,2481
+  s_98b7c727368abe::t_0772075c7fc6d8 2510-2513,2515,2517-2521,2524
+  s_98b7c727368abe::t_ba94bb72867473 2514,2516
+  s_98b7c727368abe::t_c07e58c1603656 2522-2523,2525-2526
+  s_98b7c727368abe::t_dc483f8f467285 2541-2542,2603-2630,2690-2691
+  s_98b7c727368abe::t_48060c2596d88c 2564,2577,2648-2664
+include/mazu/errordef.h
+  s_98b7c727368abe::t_e21e31bedb0186 117-123
+  s_98b7c727368abe::t_a484720cd4d712 212-215
+kernel/sync/futex.h
+  s_98b7c727368abe::t_33be6b4c00f988 72-75
+kernel/sync/mutex.c
+  s_98b7c727368abe::t_a4622c01942d91 69-74,76
+  s_98b7c727368abe::t_4fbe6223bdecc0 108-117
+  s_98b7c727368abe::t_6eb9241daaa9a0 139-142,146
+  s_cbf4ef52344fd9::t_81851be66e9df7 143-145,147-148
+  s_98b7c727368abe::t_41e3a570d95cc4 228-232,235,237,240
+  s_98b7c727368abe::t_436ee45987f240 259,261
+  s_98b7c727368abe::t_6b60763780c15c 364-367
+  s_98b7c727368abe::t_fa9ba007341aac 412-414
+  s_98b7c727368abe::t_5aacecab6568b7 466,468,488-489,491,493-495,501,508-510,513,520,522,524-525
+  s_98b7c727368abe::t_eaf7a424edea8f 537-548,551,557,559,565,567,581-583,593,597,599-600
+kernel/sync/mutex.h
+  s_98b7c727368abe::t_8e9acea51c4e8e 78-91
+kernel/sync/futex.c
+  s_98b7c727368abe::t_08d48c569eb90b 28-32
+  s_98b7c727368abe::t_ef7083bb5dfb6c 124-138
+  s_98b7c727368abe::t_b452f142b1d78c 231-252
+  s_98b7c727368abe::t_1f2d187da09f6c 717-744
+include/mazu/sched.h
+  s_98b7c727368abe::t_040887cdbbaee7 196-204
+docs/pse51-matrix.md
+  s_98b7c727368abe::t_e6f83a0bcdefc8 104
+  s_98b7c727368abe::t_eb2931dcf0989d 106
+  s_98b7c727368abe::t_68fda6683dcff1 108
+  s_98b7c727368abe::t_ea34b7f8884f30 111
+  s_98b7c727368abe::t_d7b7e4666609b8 159-162
+  s_98b7c727368abe::t_4fcb0182793d3e 281-286
+kernel/sched/core.c
+  s_98b7c727368abe::t_5fde1b5f746cba 1039
+  s_98b7c727368abe::t_7bb6abd847cb61 1127
+  s_98b7c727368abe::t_f113125526a978 1636
+kernel/ipc/mqueue.c
+  s_98b7c727368abe::t_3425fe33f85b0d 203-210
+  s_98b7c727368abe::t_f08264a64c937b 265-267
+  s_98b7c727368abe::t_21e119f2d0ccca 410-411
+  s_98b7c727368abe::t_e2929754f5fc1d 549,554,556
+  s_98b7c727368abe::t_c07f55913c927b 550-553,555
+  s_98b7c727368abe::t_518d72e87c0866 664,666
+  s_98b7c727368abe::t_d230372fcfd8e3 665
+kernel/ipc/mqueue.h
+  s_98b7c727368abe::t_42afc8a527969d 21-25
+  s_98b7c727368abe::t_4916255ab41530 75-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "be18f33073e07e99c2547ed3c9b1f4c1ee2dd6af",
+  "prompts": {},
+  "sessions": {
+    "s_98b7c727368abe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ea8c11b-3af6-4143-b8f2-83d24d9e2b56",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_cbf4ef52344fd9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "58e0d0e9-d90b-4c47-95aa-8a3245e865a7",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
