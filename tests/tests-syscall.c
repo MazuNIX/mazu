@@ -2,6 +2,7 @@
 #include <kernel/ipc/mqueue.h>
 #include <kernel/sync/sync_handle.h>
 #include <mazu/cap.h>
+#include <mazu/posix_time.h>
 #include <mazu/selftest.h>
 #include <mazu/syscall.h>
 #include <mazu/uaccess.h>
@@ -67,6 +68,37 @@ static i32 selftest_sys_open_mints_non_grant_fd(void)
 DEFINE_SELFTEST(sys_open_mints_non_grant_fd,
                 selftest_sys_open_mints_non_grant_fd);
 
+static i32 selftest_sys_open_sync_flags(void)
+{
+    if (!syscall_test_vfs_available())
+        return 0;
+
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const char path[] = "/hello.txt";
+    const vaddr_t va = USER_DATA_BASE + (138UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+    assert(copy_to_user(va, path, sizeof(path)) == 0);
+
+    struct trap_frame tf = {0};
+    tf.a0 = va;
+    tf.a1 = sizeof(path) - 1;
+    tf.a2 = O_SYNC | O_DSYNC;
+    i64 fd = sys_open(&tf, td);
+    assert(fd >= 0);
+    assert(cap_fd_open_flags(p, (i32) fd) == (O_SYNC | O_DSYNC));
+
+    tf.a2 = O_SYNC | 0x4;
+    assert(sys_open(&tf, td) == -(i64) EINVAL);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_open_sync_flags, selftest_sys_open_sync_flags);
+
 static i32 selftest_sys_mq_open_emfile_rollback(void)
 {
     struct proc *p;
@@ -97,6 +129,57 @@ static i32 selftest_sys_mq_open_emfile_rollback(void)
 DEFINE_SELFTEST(sys_mq_open_emfile_rollback,
                 selftest_sys_mq_open_emfile_rollback);
 
+static i32 selftest_sys_mq_timedsend_past_deadline_with_space(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (143UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a0 = 1;
+    tf.a1 = 1;
+    i64 handle = sys_mq_open(&tf, td);
+    assert(handle >= 0);
+
+    u8 msg = 0x5a;
+    struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = 1,
+    };
+    assert(copy_to_user(va, &msg, sizeof(msg)) == 0);
+    assert(copy_to_user(va + 32, &ts, sizeof(ts)) == 0);
+
+    tf.a7 = SYS_MQ_TIMEDSEND;
+    tf.a0 = (u64) handle;
+    tf.a1 = va;
+    tf.a2 = 1;
+    tf.a3 = 0;
+    tf.a4 = va + 32;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    u32 prio = U32_MAX;
+    tf.a7 = SYS_MQ_RECEIVE;
+    tf.a0 = (u64) handle;
+    tf.a1 = va;
+    tf.a2 = 1;
+    tf.a3 = va + 64;
+    assert(syscall_dispatch(&tf, td) == 1);
+    u8 out = 0;
+    assert(copy_from_user(&out, va, sizeof(out)) == 0);
+    assert(copy_from_user(&prio, va + 64, sizeof(prio)) == 0);
+    assert(out == msg);
+    assert(prio == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_mq_timedsend_past_deadline_with_space,
+                selftest_sys_mq_timedsend_past_deadline_with_space);
+
 static i32 selftest_sys_mutex_init_emfile_rollback(void)
 {
     struct proc *p;
@@ -125,6 +208,42 @@ static i32 selftest_sys_mutex_init_emfile_rollback(void)
 }
 DEFINE_SELFTEST(sys_mutex_init_emfile_rollback,
                 selftest_sys_mutex_init_emfile_rollback);
+
+static i32 selftest_sys_mutex_timedlock_past_deadline_uncontended(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (144UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_MUTEX_INIT;
+    i64 handle = syscall_dispatch(&tf, td);
+    assert(handle >= 0);
+
+    struct timespec ts = {
+        .tv_sec = 0,
+        .tv_nsec = 1,
+    };
+    assert(copy_to_user(va, &ts, sizeof(ts)) == 0);
+
+    tf.a7 = SYS_MUTEX_TIMEDLOCK;
+    tf.a0 = (u64) handle;
+    tf.a1 = va;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    tf.a7 = SYS_MUTEX_UNLOCK;
+    tf.a0 = (u64) handle;
+    assert(syscall_dispatch(&tf, td) == 0);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(sys_mutex_timedlock_past_deadline_uncontended,
+                selftest_sys_mutex_timedlock_past_deadline_uncontended);
 
 static i32 selftest_sys_exit_frees_proc_slot(void)
 {
@@ -249,6 +368,31 @@ static i32 selftest_robust_pending_without_head(void)
 }
 DEFINE_SELFTEST(robust_pending_without_head,
                 selftest_robust_pending_without_head);
+
+static i32 selftest_futex_lock_pi_self_deadlock(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    assert(alloc_proc_and_task(&p, &td));
+
+    const vaddr_t va = USER_DATA_BASE + (142UL * PAGE_SIZE);
+    assert(proc_map_user_page(p, va, PT_FLAG_RW | PT_FLAG_USER).is_error ==
+           false);
+
+    u32 owner = td->id;
+    assert(copy_to_user(va, &owner, sizeof(owner)) == 0);
+
+    struct trap_frame tf = {0};
+    tf.a7 = SYS_FUTEX;
+    tf.a0 = va;
+    tf.a1 = FUTEX_LOCK_PI;
+    assert(syscall_dispatch(&tf, td) == -(i64) EDEADLK);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(futex_lock_pi_self_deadlock,
+                selftest_futex_lock_pi_self_deadlock);
 
 static i32 selftest_syscall_allow_mask(void)
 {
@@ -506,7 +650,7 @@ static i32 selftest_sys_lseek(void)
     struct result_vfs_file fres = vfs_open(STR("/hello.txt"));
     assert(!fres.is_error);
     assert(cap_open_vfs(p, result_vfs_file_checked(fres),
-                        CAP_RIGHT_READ | CAP_RIGHT_WRITE, true, fd,
+                        CAP_RIGHT_READ | CAP_RIGHT_WRITE, true, 0, fd,
                         true) == fd);
 
     /* SEEK_SET to position 10. */
@@ -653,6 +797,9 @@ static i32 selftest_sysconf_pse51_present(void)
     assert(sys_sysconf_query(_SC_THREAD_CPUTIME) == _POSIX_THREAD_CPUTIME);
     assert(sys_sysconf_query(_SC_CPUTIME) == _POSIX_CPUTIME);
     assert(sys_sysconf_query(_SC_REALTIME_SIGNALS) == _POSIX_REALTIME_SIGNALS);
+    assert(sys_sysconf_query(_SC_CLOCK_SELECTION) == _POSIX_CLOCK_SELECTION);
+    assert(sys_sysconf_query(_SC_TIMEOUTS) == _POSIX_TIMEOUTS);
+    assert(sys_sysconf_query(_SC_SYNCHRONIZED_IO) == _POSIX_SYNCHRONIZED_IO);
     return 0;
 }
 DEFINE_SELFTEST(sysconf_pse51_present, selftest_sysconf_pse51_present);
@@ -663,11 +810,9 @@ static i32 selftest_sysconf_pse51_absent(void)
      * (POSIX-style "absent") rather than -EINVAL. _SC_SPIN_LOCKS is
      * here because the userspace pthread_spin_* surface is not
      * exposed; advertising the macro would let an app gate on
-     * _POSIX_SPIN_LOCKS and call absent APIs. _SC_CLOCK_SELECTION
-     * is absent because clock_nanosleep is not exposed.
+     * _POSIX_SPIN_LOCKS and call absent APIs.
      */
     assert(sys_sysconf_query(_SC_SPIN_LOCKS) == -1);
-    assert(sys_sysconf_query(_SC_CLOCK_SELECTION) == -1);
     return 0;
 }
 DEFINE_SELFTEST(sysconf_pse51_absent, selftest_sysconf_pse51_absent);
@@ -1861,7 +2006,15 @@ static i32 selftest_sigqueue_abi_numbering(void)
     static_assert(SYS_SIGQUEUE == 100, "SYS_SIGQUEUE must be appended at 100");
     static_assert(SYS_THREAD_CREATE_EXPLICIT == 101,
                   "SYS_THREAD_CREATE_EXPLICIT must be appended at 101");
-    static_assert(SYS_NR == 102, "SYS_NR must stay at 102");
+    static_assert(SYS_CLOCK_NANOSLEEP == 102,
+                  "SYS_CLOCK_NANOSLEEP must be appended at 102");
+    static_assert(SYS_MUTEX_TIMEDLOCK == 103,
+                  "SYS_MUTEX_TIMEDLOCK must be appended at 103");
+    static_assert(SYS_MQ_TIMEDSEND == 104,
+                  "SYS_MQ_TIMEDSEND must be appended at 104");
+    static_assert(SYS_CLOCK_SETTIME == 105,
+                  "SYS_CLOCK_SETTIME must be appended at 105");
+    static_assert(SYS_NR == 106, "SYS_NR must stay at 106");
     return 0;
 }
 DEFINE_SELFTEST(sigqueue_abi_numbering, selftest_sigqueue_abi_numbering);

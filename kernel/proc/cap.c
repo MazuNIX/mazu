@@ -789,6 +789,16 @@ bool cap_fd_pipe_read_end(struct proc *p, i32 fd)
     return read_end;
 }
 
+u32 cap_fd_open_flags(struct proc *p, i32 fd)
+{
+    struct cap_ref ref = cap_lookup_fd(p, fd, 0);
+    if (!ref.ptr)
+        return 0;
+    u32 open_flags = ((struct fd_pool_entry *) ref.ptr)->open_flags;
+    cap_put_ref(&ref);
+    return open_flags;
+}
+
 /* Type-specific active-use ref bumper. Called under the caller's fd_lock
  * after the cap_space slot has been validated. Returns true on success; false
  * if the underlying pool entry is already torn down.
@@ -869,6 +879,7 @@ i32 cap_open_vfs(struct proc *p,
                  struct vfs_file file,
                  u8 rights,
                  bool is_seekable,
+                 u32 open_flags,
                  i32 slot_hint,
                  bool exact_target)
 {
@@ -881,6 +892,7 @@ i32 cap_open_vfs(struct proc *p,
     struct fd_pool_entry *entry = fd_pool_entry((u16) object_index);
     entry->file = file;
     entry->is_seekable = is_seekable;
+    entry->open_flags = open_flags;
 
     u64 flags = proc_fd_lock_irqsave(p);
     i32 fd = cap_mint_fd_locked(p, (u16) object_index, rights, 0, slot_hint,

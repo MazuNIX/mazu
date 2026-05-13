@@ -11,6 +11,7 @@
 
 #include <kernel/sync/mutex.h>
 #include "tests-common.h"
+#include "tests-proc-helpers.h"
 
 /* Test 1: basic uncontended lock/unlock cycle. */
 static i32 test_mutex_basic(void)
@@ -243,3 +244,169 @@ static i32 test_mutex_owner_exit_release(void)
     return 0;
 }
 DEFINE_SELFTEST(mutex_owner_exit_release, test_mutex_owner_exit_release);
+
+static struct pi_mutex timed_mtx;
+static volatile bool timed_holder_ready;
+static volatile bool timed_holder_released;
+
+static void timed_holder_task(void *ctx __unused)
+{
+    pi_mutex_lock(&timed_mtx);
+    timed_holder_ready = true;
+    SELFTEST_KICK_AND_YIELD(80);
+    pi_mutex_unlock(&timed_mtx);
+    timed_holder_released = true;
+}
+
+static i32 test_mutex_timedlock_timeout(void)
+{
+    pi_mutex_init(&timed_mtx);
+    timed_holder_ready = false;
+    timed_holder_released = false;
+
+    struct result r =
+        sched_create_task_prio(timed_holder_task, NULL, SCHED_PRIO_NORMAL);
+    SELFTEST_ASSERT(!r.is_error, 1);
+    SELFTEST_ASSERT(!selftest_poll_flag(&timed_holder_ready, 20, 10), 2);
+    SELFTEST_ASSERT(
+        pi_mutex_lock_timed(&timed_mtx, time_ms_new(1)) == -(i32) ETIMEDOUT, 3);
+    SELFTEST_ASSERT(!selftest_poll_flag(&timed_holder_released, 20, 10), 4);
+
+    SELFTEST_ASSERT(pi_mutex_lock_timed(&timed_mtx, time_ms_new(20)) == 0, 5);
+    pi_mutex_unlock(&timed_mtx);
+    return 0;
+}
+DEFINE_SELFTEST(mutex_timedlock_timeout, test_mutex_timedlock_timeout);
+
+static struct pi_mutex transitive_mtx1;
+static struct pi_mutex transitive_mtx2;
+static volatile bool transitive_c_locked;
+static volatile bool transitive_b_locked;
+static volatile bool transitive_c_boosted;
+static volatile bool transitive_done;
+
+static void transitive_low_owner(void *ctx __unused)
+{
+    pi_mutex_lock(&transitive_mtx2);
+    transitive_c_locked = true;
+
+    for (i32 i = 0; i < 40; i++) {
+        if (sched_current_task()->td_prio >= SCHED_PRIO_HIGH) {
+            transitive_c_boosted = true;
+            break;
+        }
+        SELFTEST_KICK_AND_YIELD(10);
+    }
+
+    pi_mutex_unlock(&transitive_mtx2);
+}
+
+static void transitive_mid_owner(void *ctx __unused)
+{
+    while (!transitive_c_locked)
+        SELFTEST_KICK_AND_YIELD(5);
+
+    pi_mutex_lock(&transitive_mtx1);
+    transitive_b_locked = true;
+    pi_mutex_lock(&transitive_mtx2);
+    pi_mutex_unlock(&transitive_mtx2);
+    pi_mutex_unlock(&transitive_mtx1);
+}
+
+static void transitive_high_waiter(void *ctx __unused)
+{
+    while (!transitive_b_locked)
+        SELFTEST_KICK_AND_YIELD(5);
+
+    pi_mutex_lock(&transitive_mtx1);
+    pi_mutex_unlock(&transitive_mtx1);
+    transitive_done = true;
+}
+
+static i32 test_mutex_transitive_pi(void)
+{
+    pi_mutex_init(&transitive_mtx1);
+    pi_mutex_init(&transitive_mtx2);
+    transitive_c_locked = false;
+    transitive_b_locked = false;
+    transitive_c_boosted = false;
+    transitive_done = false;
+
+    struct result r;
+    r = sched_create_task_prio(transitive_low_owner, NULL, SCHED_PRIO_IDLE);
+    SELFTEST_ASSERT(!r.is_error, 1);
+    r = sched_create_task_prio(transitive_mid_owner, NULL, SCHED_PRIO_NORMAL);
+    SELFTEST_ASSERT(!r.is_error, 2);
+    r = sched_create_task_prio(transitive_high_waiter, NULL, SCHED_PRIO_HIGH);
+    SELFTEST_ASSERT(!r.is_error, 3);
+
+    SELFTEST_ASSERT(!selftest_poll_flag(&transitive_done, 40, 10), 4);
+    SELFTEST_ASSERT(transitive_c_boosted, 5);
+    return 0;
+}
+DEFINE_SELFTEST(mutex_transitive_pi, test_mutex_transitive_pi);
+
+static i32 test_mutex_refreshes_upstream_futex_donation(void)
+{
+    struct sched_task *owner = alloc_mock_task();
+    struct sched_task *waiter = alloc_mock_task();
+    if (!owner || !waiter) {
+        if (owner)
+            free_mock_task(owner);
+        if (waiter)
+            free_mock_task(waiter);
+        return 1;
+    }
+
+    list_init(&owner->pi_held_mutexes);
+    list_init(&owner->pi_held_futexes);
+    owner->td_base_prio = SCHED_PRIO_IDLE;
+    owner->td_prio = SCHED_PRIO_IDLE;
+
+    list_init(&waiter->pi_held_mutexes);
+    list_init(&waiter->pi_held_futexes);
+    waiter->td_base_prio = SCHED_PRIO_NORMAL;
+    waiter->td_prio = SCHED_PRIO_NORMAL;
+    waiter->state = TD_STATE_BLOCKED;
+
+    struct pi_mutex mtx;
+    pi_mutex_init(&mtx);
+    mtx.owner = owner;
+    list_add(&owner->pi_held_mutexes, &mtx.pi_held);
+
+    struct pi_mutex_waiter w = {
+        .task = waiter,
+        .granted = false,
+    };
+    list_init(&w.node);
+    list_add_tail(&mtx.waiters, &w.node);
+
+    waiter->td_waiting_on_task = owner;
+    waiter->td_waiting_on_mutex = &mtx;
+    waiter->td_waiting_on_futex = NULL;
+
+    pi_mutex_refresh_prio(waiter);
+    SELFTEST_ASSERT(waiter->td_prio == SCHED_PRIO_NORMAL, 2);
+    SELFTEST_ASSERT(owner->td_prio == SCHED_PRIO_NORMAL, 3);
+    SELFTEST_ASSERT(mtx.top_waiter_prio == SCHED_PRIO_NORMAL, 4);
+
+    waiter->td_futex_pi_prio = SCHED_PRIO_HIGH;
+    pi_mutex_refresh_prio(waiter);
+    SELFTEST_ASSERT(waiter->td_prio == SCHED_PRIO_HIGH, 5);
+    SELFTEST_ASSERT(owner->td_prio == SCHED_PRIO_HIGH, 6);
+    SELFTEST_ASSERT(mtx.top_waiter_prio == SCHED_PRIO_HIGH, 7);
+
+    waiter->td_futex_pi_prio = 0;
+    pi_mutex_refresh_prio(waiter);
+    SELFTEST_ASSERT(waiter->td_prio == SCHED_PRIO_NORMAL, 8);
+    SELFTEST_ASSERT(owner->td_prio == SCHED_PRIO_NORMAL, 9);
+    SELFTEST_ASSERT(mtx.top_waiter_prio == SCHED_PRIO_NORMAL, 10);
+
+    list_del_init(&w.node);
+    list_del_init(&mtx.pi_held);
+    free_mock_task(waiter);
+    free_mock_task(owner);
+    return 0;
+}
+DEFINE_SELFTEST(mutex_refreshes_upstream_futex_donation,
+                test_mutex_refreshes_upstream_futex_donation);

@@ -20,6 +20,7 @@
 #define _POSIX_SPAWN 200809L
 #define _POSIX_PIPE_BUF 512 /* POSIX-mandated minimum */
 #define _POSIX_FSYNC 200809L
+#define _POSIX_SYNCHRONIZED_IO 200809L
 
 /* PSE51 feature-test macros: present features only.  See docs/pse51-matrix.md
  * for the full classification (implemented vs implemented-with-mazu-abi).
@@ -35,6 +36,8 @@
 #define _POSIX_CPUTIME 200809L
 #define _POSIX_THREAD_CPUTIME 200809L
 #define _POSIX_THREADS 1 /* SYS_THREAD_*; PROC_THREAD_MAX = 4 */
+#define _POSIX_TIMEOUTS 200809L
+#define _POSIX_CLOCK_SELECTION 200809L
 /* _POSIX_REALTIME_SIGNALS reports the wait-for-signal API set
  * (sigsuspend, sigtimedwait, sigwait, sigwaitinfo). Mazu also has a
  * bounded sigqueue-style payload path, but it is exposed through a
@@ -77,9 +80,11 @@
 #define _SC_THREADS 17
 #define _SC_THREAD_CPUTIME 18
 #define _SC_CPUTIME 19
-#define _SC_CLOCK_SELECTION 20 /* not implemented: returns -1 */
+#define _SC_CLOCK_SELECTION 20
+#define _SC_TIMEOUTS 21
+#define _SC_SYNCHRONIZED_IO 22
 
-#define _SC_NR 21 /* total number of sysconf names */
+#define _SC_NR 23 /* total number of sysconf names */
 
 /* Kernel-callable sysconf query.  Returns the value for the given _SC_
  * name, or -EINVAL for unknown names.

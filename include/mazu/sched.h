@@ -41,7 +41,9 @@
 /* Magic number for struct sched_task (ASCII 'task'). */
 #define TASK_MAGIC 0x7461736BU
 
-struct proc; /* forward declaration; defined in <mazu/proc.h> */
+struct proc;     /* forward declaration; defined in <mazu/proc.h> */
+struct pi_mutex; /* forward declaration; defined in kernel/sync/mutex.h */
+struct futex_pi_state;
 
 #define TASK_STACK_SIZE 0x4000
 #define TASK_GUARD_SIZE PAGE_SIZE
@@ -58,6 +60,7 @@ struct proc; /* forward declaration; defined in <mazu/proc.h> */
 
 #define SCHED_POLICY_NORMAL 0
 #define SCHED_POLICY_DEADLINE 1
+
 /* Per-task EDF scheduling entity.  All time values in timer ticks.
  *
  * Lifecycle:
@@ -188,23 +191,41 @@ struct sched_task {
     struct list_head kres_list; /* per-task resource auto-cleanup chain */
     struct list_head
         pi_held_mutexes; /* PI mutexes currently held by this task */
+    struct list_head
+        pi_held_futexes; /* PI futexes currently owned by this task */
+    /* Serializes all access to pi_held_mutexes / pi_held_futexes and the
+     * derived td_prio / td_futex_pi_prio fields.  Without this lock, two
+     * harts holding different mutex/futex bucket locks can race when one
+     * walks the list (priority recomputation) while the other inserts or
+     * removes a node from it, since each side's outer lock covers only its
+     * own primitive.  Always taken as the innermost lock (LOCK_LEVEL_NONE);
+     * never held across a yield, copy_*_user, or another spinlock.
+     */
+    spinlock_t td_pi_lock;
+    u8 td_futex_pi_prio; /* highest futex PI waiter priority, or 0 */
+    struct sched_task
+        *td_waiting_on_task; /* owner this task is PI-blocked behind, or NULL */
+    struct pi_mutex
+        *td_waiting_on_mutex; /* mutex this task is queued on, or NULL */
+    struct futex_pi_state *td_waiting_on_futex; /* futex PI state this task is
+                                                   queued on, or NULL */
 
     struct callout td_sleep_callout;   /* drives timed wakeups back to READY */
     struct callout td_quantum_callout; /* drives hard-RT quantum expiry */
     u64 td_wakeup_ticks; /* rdtime when the task most recently became READY */
 
     /* Exponential decay load estimation (managarm-inspired).
-     * Updated on each context switch: load_avg decays toward zero when
-     * the task is sleeping, and grows toward LOAD_SCALE when running.
-     * Used by the SMP load balancer to make migration decisions.
+     * Updated on each context switch: load_avg decays toward zero when the task
+     * is sleeping, and grows toward LOAD_SCALE when running. Used by the SMP
+     * load balancer to make migration decisions.
      */
     u64 load_avg; /* fixed-point Q16 load estimate */
 
     /* EEVDF scheduling state (Earliest Eligible Virtual Deadline First).
      * vruntime: accumulated virtual CPU ticks consumed by this task.
      * vdeadline: vruntime + virtual_slice, set on enqueue.
-     * Pick-next selects the eligible task with earliest vdeadline within
-     * each priority level, bounding wake-to-run latency to one slice.
+     * Pick-next selects the eligible task with earliest vdeadline within each
+     * priority level, bounding wake-to-run latency to one slice.
      */
     u64 vruntime;
     u64 vdeadline;
@@ -222,6 +243,9 @@ struct sched_task {
     bool td_cleanup_queued; /* once set, task is already staged for deferred
                              * destruction and must not be queued again
                              */
+    bool td_realtime_wait_active; /* absolute CLOCK_REALTIME wait armed */
+    u32 td_realtime_wait_seq;     /* clock-set generation seen at arm time */
+    struct list_head td_realtime_wait_node; /* membership in restart list */
     sched_block_cleanup_fn_t td_block_cleanup;
     void *td_block_cleanup_ctx;
 
@@ -249,20 +273,21 @@ struct sched_task {
         ptr frame_prev;
         u32 frame_cookie;
         u32 frame_prev_cookie;
+
         /* Signal mask to restore on return-to-user after sigsuspend.
-         * sys_sigsuspend_h captures the prior blocked mask here and
-         * sets sigsuspend_active = true; signal_deliver / SIG_IGN
-         * dequeue consult these to wire the original mask into the
-         * signal frame so sigreturn restores it instead of the
-         * temporary suspend mask.
+         * sys_sigsuspend_h captures the prior blocked mask here and sets
+         * sigsuspend_active = true; signal_deliver / SIG_IGN dequeue consult
+         * these to wire the original mask into the signal frame so sigreturn
+         * restores it instead of the temporary suspend mask.
          */
         u32 sigsuspend_saved_blocked;
         bool sigsuspend_active;
+
         /* Signal set this thread is parked on in sigtimedwait.
-         * signal_send-style writers check it before nudging the
-         * thread, so a sleeping sigtimedwait thread is woken only
-         * by a signal that matches its set (eliminating spurious
-         * wakeups).  0 means the thread is not in sigtimedwait.
+         * signal_send-style writers check it before nudging the thread, so a
+         * sleeping sigtimedwait thread is woken only by a signal that matches
+         * its set (eliminating spurious wakeups). 0 means the thread is not in
+         * sigtimedwait.
          */
         u32 sigwait_set;
     } td_sig;
@@ -300,15 +325,14 @@ struct sched_task {
     bool td_exit_started;
     i16 td_cap_slot;
 
-    /* PSE51 cancellation state (pthread_cancel / _setcancelstate /
-     * _setcanceltype / _testcancel).  td_cancel_pending is set by
-     * pthread_cancel and consumed at the next cancellation point.
-     * td_cancel_disabled disables cancellation entirely.  ASYNC type
-     * is treated as DEFERRED here because Mazu has no in-kernel
-     * cancellation points other than blocking syscalls (which check
-     * the flag on entry); ASYNC interruption inside arbitrary user
-     * code would require user-space libc cooperation that the
-     * kernel layer cannot provide on its own.
+    /* PSE51 cancellation state (pthread_{cancel,setcancelstate,_setcanceltype,
+     * _testcancel}). td_cancel_pending is set by pthread_cancel and consumed at
+     * the next cancellation point. td_cancel_disabled disables cancellation
+     * entirely. ASYNC type is treated as DEFERRED here because Mazu has no
+     * in-kernel cancellation points other than blocking syscalls (which check
+     * the flag on entry); ASYNC interruption inside arbitrary user code would
+     * require user-space libc cooperation that the kernel layer cannot provide
+     * on its own.
      */
     bool td_cancel_pending;
     bool td_cancel_disabled;
@@ -362,10 +386,9 @@ i32 sched_create_user_thread(struct proc *p,
                              u32 inherited_sigmask,
                              struct sched_task **out_td);
 
-/* Free a user thread that exited in JOINABLE state and has now been
- * reaped via SYS_THREAD_JOIN. The caller must have transitioned
- * td_join_state from EXITED to REAPED under proc_sig_lock so no other
- * thread can race the free.
+/* Free a user thread that exited in JOINABLE state and has now been reaped via
+ * SYS_THREAD_JOIN. The caller must have transitioned td_join_state from EXITED
+ * to REAPED under proc_sig_lock so no other thread can race the free.
  */
 void sched_reap_user_thread(struct sched_task *dead);
 

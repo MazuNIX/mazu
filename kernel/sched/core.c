@@ -1035,6 +1035,8 @@ static void sched_init_idle(struct sched_task *idle, struct pcpu *pc, u8 prio)
     list_init(&idle->sleep_list);
     list_init(&idle->kres_list);
     list_init(&idle->pi_held_mutexes);
+    list_init(&idle->pi_held_futexes);
+    idle->td_pi_lock = (spinlock_t) SPINLOCK_INITIALIZER;
 
     callout_init(&idle->td_sleep_callout);
     callout_init(&idle->td_quantum_callout);
@@ -1121,6 +1123,8 @@ static struct sched_task *sched_task_alloc_init(void)
     list_init(&task->sleep_list);
     list_init(&task->kres_list);
     list_init(&task->pi_held_mutexes);
+    list_init(&task->pi_held_futexes);
+    task->td_pi_lock = (spinlock_t) SPINLOCK_INITIALIZER;
 
     callout_init(&task->td_sleep_callout);
     callout_init(&task->td_quantum_callout);
@@ -1628,6 +1632,8 @@ void sched_init(void)
     list_init(&global_main_task.sleep_list);
     list_init(&global_main_task.kres_list);
     list_init(&global_main_task.pi_held_mutexes);
+    list_init(&global_main_task.pi_held_futexes);
+    global_main_task.td_pi_lock = (spinlock_t) SPINLOCK_INITIALIZER;
     callout_init(&global_main_task.td_sleep_callout);
     callout_init(&global_main_task.td_quantum_callout);
     global_main_task.td_quantum = sched_default_quantum[SCHED_PRIO_IDLE];

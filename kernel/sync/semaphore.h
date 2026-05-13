@@ -5,6 +5,10 @@
  * the counter only grows when no waiters exist.  This ensures
  * deterministic wake latency (STK-inspired).
  *
+ * Semaphores have no owner concept, so they do not participate in
+ * priority inheritance. Use pi_mutex for owner-sensitive RT critical
+ * sections where inversion bounds matter.
+ *
  * Lock ordering: sem->lock (WAITQ) -> pcpu_runq_lock (SCHED).
  */
 

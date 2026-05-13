@@ -111,6 +111,8 @@ i32 condvar_wait_timeout(struct condvar *cv,
 
     for (;;) {
         sched_yield_trap();
+        if (realtime_clock_wait_should_restart(wqe.task))
+            break;
         if (wait_should_exit(wqe.reason))
             break;
         prepare_to_wait(&cv->wq, &wqe);
@@ -126,6 +128,15 @@ i32 condvar_wait_timeout(struct condvar *cv,
         abort = wait_abort_error_current();
 
     pi_mutex_lock(mtx);
+    /* Only honor a clock-settime restart when the wakeup was NOT a real
+     * cv_{signal,broadcast} (WAIT_UNBLOCK_WAKEUP). If we restarted on a genuine
+     * wakeup that raced with SYS_CLOCK_SETTIME the caller would re-enter the
+     * wait and drop the signal on the floor. Timeout and destroy already steer
+     * to other branches above.
+     */
+    if (abort == 0 && wqe.reason != WAIT_UNBLOCK_WAKEUP && !timed_out &&
+        realtime_clock_wait_should_restart(wqe.task))
+        return MAZU_WAIT_ABORT_CLOCK_SETTIME;
     if (abort < 0)
         return abort;
     return timed_out ? -(i32) ETIMEDOUT : 0;

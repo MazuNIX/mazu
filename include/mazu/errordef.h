@@ -114,6 +114,13 @@ static inline struct result result_ok(void)
 #define EHOSTUNREACH 113
 #define ECANCELED 125 /* operation canceled (POSIX, pthread_cancel) */
 #define ENOTSUP 95    /* operation not supported (POSIX) */
+/* POSIX robust-mutex semantics: the previous owner died holding the lock
+ * (EOWNERDEAD), or the protected state cannot be recovered and the mutex
+ * is now permanently unusable (ENOTRECOVERABLE).  Numbers match Linux's
+ * asm-generic/errno.h so libc wrappers do not need translation.
+ */
+#define EOWNERDEAD 130
+#define ENOTRECOVERABLE 131
 
 static inline struct str error_code_str(u16 code)
 {
@@ -202,6 +209,10 @@ static inline struct str error_code_str(u16 code)
         return STR("Operation canceled (ECANCELED)");
     case ENOTSUP:
         return STR("Operation not supported (ENOTSUP)");
+    case EOWNERDEAD:
+        return STR("Owner died (EOWNERDEAD)");
+    case ENOTRECOVERABLE:
+        return STR("State not recoverable (ENOTRECOVERABLE)");
     default:
         return STR("Unknown error");
     }
