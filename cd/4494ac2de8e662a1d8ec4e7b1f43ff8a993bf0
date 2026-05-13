@@ -1,0 +1,19 @@
+lib/json.c
+  s_d30e57a7122553::t_3cbb48c0d00174 232-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "cd4494ac2de8e662a1d8ec4e7b1f43ff8a993bf0",
+  "prompts": {},
+  "sessions": {
+    "s_d30e57a7122553": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41195e80-7fab-4845-913a-5cb58a295101",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
