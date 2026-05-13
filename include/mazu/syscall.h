@@ -193,8 +193,9 @@
  * this branch.
  */
 #define SYS_SIGQUEUE 100
+#define SYS_THREAD_CREATE_EXPLICIT 101
 
-#define SYS_NR 101 /* total number of syscalls */
+#define SYS_NR 102 /* total number of syscalls */
 
 /* pthread_setcancelstate state values. */
 #define PTHREAD_CANCEL_ENABLE 0

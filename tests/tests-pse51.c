@@ -15,6 +15,7 @@
 #include <mazu/ipi.h>
 #include <mazu/list.h>
 #include <mazu/posix_time.h>
+#include <mazu/pthread.h>
 #include <mazu/selftest.h>
 #include <mazu/syscall.h>
 #include <mazu/sysconf.h>
@@ -384,6 +385,228 @@ static i32 test_pse51_sched_thread_profile(void)
     return 0;
 }
 DEFINE_SELFTEST(pse51_sched_thread_profile, test_pse51_sched_thread_profile);
+
+static i32 test_pse51_pthread_attr_profile(void)
+{
+    pthread_attr_t attr;
+    i32 state = 0;
+    i32 inheritsched = 0;
+    i32 policy = 0;
+    sz size = 0;
+    void *addr = NULL;
+    struct sched_param param;
+
+    /* NULL guards on every entry point. */
+    SELFTEST_ASSERT(pthread_attr_init(NULL) == EINVAL, 1);
+    SELFTEST_ASSERT(pthread_attr_destroy(NULL) == EINVAL, 2);
+    SELFTEST_ASSERT(pthread_attr_setdetachstate(NULL, 0) == EINVAL, 3);
+    SELFTEST_ASSERT(pthread_attr_getdetachstate(NULL, &state) == EINVAL, 4);
+    SELFTEST_ASSERT(pthread_attr_setinheritsched(NULL, 0) == EINVAL, 5);
+    SELFTEST_ASSERT(pthread_attr_getinheritsched(NULL, &inheritsched) == EINVAL,
+                    6);
+    SELFTEST_ASSERT(pthread_attr_setschedpolicy(NULL, SCHED_FIFO) == EINVAL, 7);
+    SELFTEST_ASSERT(pthread_attr_getschedpolicy(NULL, &policy) == EINVAL, 8);
+    SELFTEST_ASSERT(pthread_attr_setschedparam(NULL, &param) == EINVAL, 9);
+    SELFTEST_ASSERT(pthread_attr_getschedparam(NULL, &param) == EINVAL, 10);
+    SELFTEST_ASSERT(
+        pthread_attr_setstacksize(NULL, PTHREAD_STACK_MIN) == EINVAL, 11);
+    SELFTEST_ASSERT(pthread_attr_getstacksize(NULL, &size) == EINVAL, 12);
+    SELFTEST_ASSERT(
+        pthread_attr_setstack(NULL, NULL, PTHREAD_STACK_MIN) == EINVAL, 13);
+    SELFTEST_ASSERT(pthread_attr_getstack(NULL, &addr, &size) == EINVAL, 14);
+
+    SELFTEST_ASSERT(pthread_attr_init(&attr) == 0, 20);
+
+    /* Defaults match POSIX: joinable, inherit-sched, FIFO, normal prio. */
+    SELFTEST_ASSERT(pthread_attr_getdetachstate(&attr, &state) == 0, 21);
+    SELFTEST_ASSERT(state == PTHREAD_CREATE_JOINABLE, 22);
+    SELFTEST_ASSERT(pthread_attr_getinheritsched(&attr, &inheritsched) == 0,
+                    23);
+    SELFTEST_ASSERT(inheritsched == PTHREAD_INHERIT_SCHED, 24);
+    SELFTEST_ASSERT(pthread_attr_getschedpolicy(&attr, &policy) == 0, 25);
+    SELFTEST_ASSERT(policy == SCHED_FIFO, 26);
+    SELFTEST_ASSERT(pthread_attr_getschedparam(&attr, &param) == 0, 27);
+    SELFTEST_ASSERT(param.sched_priority == SCHED_PRIO_NORMAL, 28);
+    SELFTEST_ASSERT(pthread_attr_getstacksize(&attr, &size) == 0, 29);
+    SELFTEST_ASSERT(size == USER_STACK_SIZE, 30);
+
+    /* detachstate: valid round-trip, invalid value rejected. */
+    SELFTEST_ASSERT(
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0, 31);
+    SELFTEST_ASSERT(pthread_attr_getdetachstate(&attr, &state) == 0, 32);
+    SELFTEST_ASSERT(state == PTHREAD_CREATE_DETACHED, 33);
+    SELFTEST_ASSERT(pthread_attr_setdetachstate(&attr, 99) == EINVAL, 34);
+    SELFTEST_ASSERT(pthread_attr_getdetachstate(&attr, &state) == 0, 35);
+    SELFTEST_ASSERT(state == PTHREAD_CREATE_DETACHED, 36);
+
+    /* inheritsched: valid round-trip, invalid value rejected. */
+    SELFTEST_ASSERT(
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0, 40);
+    SELFTEST_ASSERT(pthread_attr_getinheritsched(&attr, &inheritsched) == 0,
+                    41);
+    SELFTEST_ASSERT(inheritsched == PTHREAD_EXPLICIT_SCHED, 42);
+    SELFTEST_ASSERT(pthread_attr_setinheritsched(&attr, 99) == EINVAL, 43);
+
+    /* schedpolicy: all three POSIX policies round-trip; bad value rejected. */
+    SELFTEST_ASSERT(pthread_attr_setschedpolicy(&attr, SCHED_OTHER) == 0, 50);
+    SELFTEST_ASSERT(pthread_attr_getschedpolicy(&attr, &policy) == 0, 51);
+    SELFTEST_ASSERT(policy == SCHED_OTHER, 52);
+    SELFTEST_ASSERT(pthread_attr_setschedpolicy(&attr, SCHED_RR) == 0, 53);
+    SELFTEST_ASSERT(pthread_attr_getschedpolicy(&attr, &policy) == 0, 54);
+    SELFTEST_ASSERT(policy == SCHED_RR, 55);
+    SELFTEST_ASSERT(pthread_attr_setschedpolicy(&attr, 0xFF) == EINVAL, 56);
+
+    /* schedparam: bounds checked against the kernel range. */
+    param.sched_priority = SCHED_PRIO_IDLE;
+    SELFTEST_ASSERT(pthread_attr_setschedparam(&attr, &param) == 0, 60);
+    SELFTEST_ASSERT(pthread_attr_getschedparam(&attr, &param) == 0, 61);
+    SELFTEST_ASSERT(param.sched_priority == SCHED_PRIO_IDLE, 62);
+    param.sched_priority = CONFIG_SCHED_NPRIO - 1;
+    SELFTEST_ASSERT(pthread_attr_setschedparam(&attr, &param) == 0, 63);
+    param.sched_priority = CONFIG_SCHED_NPRIO;
+    SELFTEST_ASSERT(pthread_attr_setschedparam(&attr, &param) == EINVAL, 64);
+    param.sched_priority = -1;
+    SELFTEST_ASSERT(pthread_attr_setschedparam(&attr, &param) == EINVAL, 65);
+
+    /* stacksize: below-min rejected; only the kernel's fixed per-thread
+     * size is accepted.
+     */
+    SELFTEST_ASSERT(
+        pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN - 1) == EINVAL, 70);
+    SELFTEST_ASSERT(
+        pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN) == ENOTSUP, 71);
+    SELFTEST_ASSERT(pthread_attr_getstacksize(&attr, &size) == 0, 72);
+    SELFTEST_ASSERT(size == USER_STACK_SIZE, 73);
+    SELFTEST_ASSERT(pthread_attr_setstacksize(&attr, USER_STACK_SIZE) == 0, 74);
+    SELFTEST_ASSERT(pthread_attr_getstacksize(&attr, &size) == 0, 75);
+    SELFTEST_ASSERT(size == USER_STACK_SIZE, 76);
+
+    /* setstack always returns ENOTSUP. POSIX semantics need a real
+     * caller-supplied stack region; Mazu's shared-VA model places every
+     * thread's stack at a fixed kernel-chosen VA, so the call cannot
+     * be honored. getstack still round-trips whatever pthread_attr_init
+     * stored.
+     */
+    SELFTEST_ASSERT(
+        pthread_attr_setstack(&attr, NULL, PTHREAD_STACK_MIN) == ENOTSUP, 80);
+    SELFTEST_ASSERT(pthread_attr_setstack(&attr, (void *) 0x10000,
+                                          PTHREAD_STACK_MIN) == ENOTSUP,
+                    81);
+    SELFTEST_ASSERT(pthread_attr_getstack(&attr, &addr, &size) == 0, 82);
+    SELFTEST_ASSERT(addr == NULL, 83);
+
+    /* Resolve helpers: inherit-sched uses the historical two-argument
+     * SYS_THREAD_CREATE ABI. EXPLICIT_SCHED selects the dedicated
+     * SYS_THREAD_CREATE_EXPLICIT entry point and encodes (prio + 1) in
+     * a2. If a caller has bypassed the setters and parked an out-of-range
+     * priority, the helper passes it through and the kernel returns
+     * EINVAL, instead of silently demoting the request to inherit.
+     */
+    SELFTEST_ASSERT(
+        pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED) == 0, 90);
+    param.sched_priority = SCHED_PRIO_HIGH;
+    SELFTEST_ASSERT(pthread_attr_setschedparam(&attr, &param) == 0, 91);
+    SELFTEST_ASSERT(
+        pthread_attr_resolve_create_syscall(&attr) == SYS_THREAD_CREATE, 92);
+    SELFTEST_ASSERT(pthread_attr_resolve_prio_arg(&attr) == 0, 93);
+    SELFTEST_ASSERT(
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0, 94);
+    SELFTEST_ASSERT(pthread_attr_resolve_create_syscall(&attr) ==
+                        SYS_THREAD_CREATE_EXPLICIT,
+                    95);
+    SELFTEST_ASSERT(
+        pthread_attr_resolve_prio_arg(&attr) == (u64) (SCHED_PRIO_HIGH + 1),
+        96);
+    SELFTEST_ASSERT(
+        pthread_attr_resolve_create_syscall(NULL) == SYS_THREAD_CREATE, 97);
+    SELFTEST_ASSERT(pthread_attr_resolve_prio_arg(NULL) == 0, 98);
+    /* Direct-write out-of-range priority encodes to a sentinel above
+     * CONFIG_SCHED_NPRIO, which the kernel's a2 bound check rejects.
+     * The negative case is the load-bearing one: a naive (u64) cast
+     * of i32 -1 plus 1 wraps to 0 and would mimic the inherit
+     * encoding, so the bound check has to run before the cast.
+     */
+    attr.sched_priority = CONFIG_SCHED_NPRIO + 5;
+    SELFTEST_ASSERT(
+        pthread_attr_resolve_prio_arg(&attr) > (u64) CONFIG_SCHED_NPRIO, 99);
+    attr.sched_priority = -1;
+    SELFTEST_ASSERT(
+        pthread_attr_resolve_prio_arg(&attr) > (u64) CONFIG_SCHED_NPRIO, 100);
+
+    SELFTEST_ASSERT(pthread_attr_destroy(&attr) == 0, 101);
+    return 0;
+}
+DEFINE_SELFTEST(pse51_pthread_attr_profile, test_pse51_pthread_attr_profile);
+
+/* SYS_THREAD_CREATE stays a strict two-argument ABI: it ignores a2 so
+ * pre-existing callers that do not clear unused registers keep working.
+ * SYS_THREAD_CREATE_EXPLICIT carries the opt-in explicit-priority
+ * encoding in a2 so a libc pthread_create with PTHREAD_EXPLICIT_SCHED
+ * can spawn at a non-default priority without the
+ * SYS_THREAD_SETSCHEDPARAM race window. Encoding: a2 == 0 -> inherit,
+ * a2 in [1, CONFIG_SCHED_NPRIO] -> explicit prio (a2 - 1).
+ * Out-of-range -> EINVAL; raising above the creator's base priority
+ * -> EPERM.
+ *
+ * The test passes u_entry = 0, which fails proc_vma_check_access with
+ * EFAULT after the priority arm of the handler runs. That lets us
+ * exercise the validation path without standing up an executable VMA
+ * and a runnable stack.
+ */
+static i32 test_pse51_thread_create_prio_abi(void)
+{
+    struct proc *p;
+    struct sched_task *td;
+    struct trap_frame tf = {0};
+
+    SELFTEST_ASSERT(alloc_proc_and_task(&p, &td), 1);
+
+    /* Establish a known creator base priority so the privilege bound
+     * has a non-trivial threshold to assert against.
+     */
+    td->td_base_prio = SCHED_PRIO_HIGH;
+
+    tf.a7 = SYS_THREAD_CREATE;
+    tf.a0 = 0;
+    tf.a1 = 0;
+
+    /* Historical ABI: a2 is ignored, even if it contains garbage. */
+    tf.a2 = (u64) CONFIG_SCHED_NPRIO + 1;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EFAULT, 2);
+
+    tf.a7 = SYS_THREAD_CREATE_EXPLICIT;
+
+    /* a2 == 0: inherit; proc_vma_check_access fails first with EFAULT. */
+    tf.a2 = 0;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EFAULT, 3);
+
+    /* a2 == 1: explicit prio 0 (IDLE), passes prio check, falls through
+     * to EFAULT for the same reason.
+     */
+    tf.a2 = 1;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EFAULT, 4);
+
+    /* a2 = creator's base + 1: explicit prio == base, allowed. */
+    tf.a2 = (u64) td->td_base_prio + 1;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EFAULT, 5);
+
+    /* a2 = base + 2: explicit prio == base + 1, would raise above the
+     * creator. EPERM gates this before the entry check.
+     */
+    if ((u64) td->td_base_prio + 2 <= (u64) CONFIG_SCHED_NPRIO) {
+        tf.a2 = (u64) td->td_base_prio + 2;
+        SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EPERM, 6);
+    }
+
+    /* a2 > CONFIG_SCHED_NPRIO: out of range. */
+    tf.a2 = (u64) CONFIG_SCHED_NPRIO + 1;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EINVAL, 7);
+
+    free_proc_and_task(p, td);
+    return 0;
+}
+DEFINE_SELFTEST(pse51_thread_create_prio_abi,
+                test_pse51_thread_create_prio_abi);
 
 static i32 test_pse51_signal_profile(void)
 {

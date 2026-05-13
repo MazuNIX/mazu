@@ -2668,14 +2668,43 @@ static i64 sys_sigprocmask_h(struct trap_frame *tf, struct sched_task *td)
  * (sig pending/blocked, signal-frame chain, robust futex,
  * exit_code, join waitqueue) lives on struct sched_task.
  */
-static i64 sys_thread_create_h(struct trap_frame *tf, struct sched_task *td)
+static i64 sys_thread_create_common(struct trap_frame *tf,
+                                    struct sched_task *td,
+                                    bool use_explicit_prio_abi)
 {
     if (!td || !td->proc)
         return -(i64) EPERM;
     ptr u_entry = (ptr) tf->a0;
     ptr u_arg = (ptr) tf->a1;
-    /* Inherit creator's base priority unless caller specifies one. */
-    u8 prio = td->td_base_prio;
+    u8 creator_base_prio = __atomic_load_n(&td->td_base_prio, __ATOMIC_RELAXED);
+    u8 prio = creator_base_prio;
+    if (use_explicit_prio_abi) {
+        /* Priority encoding in a2:
+         *   0                          -> inherit creator's base priority.
+         *   1..CONFIG_SCHED_NPRIO      -> explicit (prio = a2 - 1).
+         *   anything else              -> EINVAL.
+         *
+         * This lives on a dedicated syscall number so the historical
+         * SYS_THREAD_CREATE ABI remains a strict two-argument interface.
+         * Pre-existing callers are not required to clear a2 before
+         * ecall. The privilege bound matches pthread_setschedparam:
+         * a thread may not spawn a child above its own base priority.
+         *
+         * Snapshot td_base_prio once: a cross-hart setschedparam can
+         * mutate it between the inherit-default read and the EPERM
+         * comparison, and using the same snapshot for both keeps the
+         * decision internally consistent.
+         */
+        u64 a2 = tf->a2;
+        if (a2 != 0) {
+            if (a2 > (u64) CONFIG_SCHED_NPRIO)
+                return -(i64) EINVAL;
+            u8 explicit_prio = (u8) (a2 - 1);
+            if (explicit_prio > creator_base_prio)
+                return -(i64) EPERM;
+            prio = explicit_prio;
+        }
+    }
 
     /* Validate the entry point is in an executable VMA. The arg is
      * an opaque pointer the user passes through; do not validate it.
@@ -2691,6 +2720,17 @@ static i64 sys_thread_create_h(struct trap_frame *tf, struct sched_task *td)
     if (rc < 0)
         return (i64) rc;
     return cap_get_token(td->proc, new_td->td_cap_slot, CAP_TYPE_THREAD);
+}
+
+static i64 sys_thread_create_h(struct trap_frame *tf, struct sched_task *td)
+{
+    return sys_thread_create_common(tf, td, false);
+}
+
+static i64 sys_thread_create_explicit_h(struct trap_frame *tf,
+                                        struct sched_task *td)
+{
+    return sys_thread_create_common(tf, td, true);
 }
 
 static bool thread_target_is_live(const struct sched_task *target)
@@ -3343,6 +3383,8 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
 
     /* Thread management (item 15d) */
     [SYS_THREAD_CREATE] = {sys_thread_create_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_THREAD_CREATE_EXPLICIT] = {sys_thread_create_explicit_h,
+                                    SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_JOIN] = {sys_thread_join_h, SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_DETACH] = {sys_thread_detach_h, SYSCALL_F_NEEDS_PROC},
     [SYS_THREAD_EXIT] = {sys_thread_exit_h, SYSCALL_F_NEEDS_PROC},

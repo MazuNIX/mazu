@@ -16,16 +16,9 @@ PSE51 interfaces fare on top of that base.
 ## Conformance status
 
 Mazu's PSE51-oriented userspace ABI is feature-complete: every
-mandatory PSE51 syscall is wired and exercised by selftests.
-
-One narrow gap remains that is not blocking and has reasonable
-default behavior today:
-
-1. **`pthread_attr_*` libc family**. Strictly a libc-side
-   concern. The kernel ABI accepts the resolved (entry, arg,
-   prio) tuple and exposes per-thread `setschedparam` /
-   `getschedparam`; once a PSE51 libc lands it can synthesize
-   attr objects on top of the existing kernel surface.
+mandatory PSE51 syscall is wired and exercised by selftests, and
+the `pthread_attr_*` family ships as a header-only library at
+`include/mazu/pthread.h` on top of the kernel surface.
 
 Deliberate deviations (not fix-it gaps):
 
@@ -42,13 +35,14 @@ mlock / munlock range form, fsync / fdatasync,
 sched_setscheduler / _getscheduler, SIGEV_THREAD_ID timer
 delivery, CLOCK_THREAD_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID,
 absolute-timespec timed waits, thread-exit trampoline (with
-magic verification).
+magic verification), pthread_attr_* family (header-only
+library at `include/mazu/pthread.h` plus explicit-priority
+spawn via `SYS_THREAD_CREATE_EXPLICIT`.
 
 Public docs should describe the implementation as "bounded
 PSE51-compatible userspace core". The subset framing is honest
 because Mazu intentionally exceeds PSE51 with multi-process and
-filesystem support, and because the realtime-signals queue and
-libc attr family are out of scope for the kernel layer.
+filesystem support.
 
 ## What Mazu ships today (PSE51-relevant)
 
@@ -120,12 +114,12 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | Interface (POSIX) | Mazu syscall | Status | Notes |
 |---|---|---|---|
 | `pthread_self` | `SYS_THREAD_SELF` | implemented | Returns the caller's `CAP_TYPE_THREAD` small-int handle. |
-| `pthread_create` | `SYS_THREAD_CREATE` | implemented | PROC_THREAD_MAX = 4. Slot reservation under `proc_table_lock`, per-thread stack VA inside the proc slot. Returns a fresh `CAP_TYPE_THREAD` handle. Priority inherits from creator; an explicit priority arg ABI is a future extension. |
+| `pthread_create` | `SYS_THREAD_CREATE` / `SYS_THREAD_CREATE_EXPLICIT` | implemented | PROC_THREAD_MAX = 4. Slot reservation under `proc_table_lock`, per-thread stack VA inside the proc slot. Returns a fresh `CAP_TYPE_THREAD` handle. `SYS_THREAD_CREATE` keeps the original two-argument ABI and always inherits the creator's base priority. `SYS_THREAD_CREATE_EXPLICIT` is the opt-in extension: a2 == 0 inherits, values in [1, CONFIG_SCHED_NPRIO] set explicit priority (a2 - 1), a value above CONFIG_SCHED_NPRIO returns EINVAL, and a value that would exceed the creator's base priority returns EPERM. |
 | `pthread_join` | `SYS_THREAD_JOIN` | implemented | Blocks on `target->td_join_wq`; atomically claims `EXITED -> REAPED` via cmpxchg before reaping. EDEADLK on self-join, ESRCH on unknown thread handle, EINVAL on detached/already-reaped, EINTR on cancellation. |
 | `pthread_detach` | `SYS_THREAD_DETACH` | implemented | Tries `JOINABLE -> DETACHED` first; if the target already exited, claims `EXITED -> REAPED` and reaps inline. Either claim wakes pending joiners. |
 | `pthread_exit` | `SYS_THREAD_EXIT` | implemented | Last-thread exit collapses into `proc_exit`; non-last exit unwinds the thread's robust futex list. A user thread that returns from its entry function lands on the per-process unmapped trampoline at `signal_trampoline_pc(p)+4`; the trap handler synthesizes `SYS_THREAD_EXIT(0)`, so an implicit return is equivalent to an explicit pthread_exit. |
 | `pthread_setschedparam` / `_getschedparam` | `SYS_THREAD_SETSCHEDPARAM` / `_GETSCHEDPARAM` | implemented-with-mazu-abi | Take a `CAP_TYPE_THREAD` handle (0 = self) and a scalar priority. Privilege bound: cannot raise above caller's own base priority. |
-| `pthread_attr_*` | (libc) | stubbed | Attribute objects (`setstack`, `setdetachstate`, `setschedpolicy`, `setschedparam`, `setinheritsched`) are user-space libc concerns, but a "PSE51 complete" claim requires them to exist somewhere in the toolchain image. Mazu does not ship a libc with these wrappers today. The kernel ABI accepts the resolved (entry, arg, stack, prio) tuple; once a libc lands, this row flips to `not-applicable`. |
+| `pthread_attr_*` | (libc) | implemented | Header-only library at `include/mazu/pthread.h`. Covers `pthread_attr_init` / `_destroy` / `_setdetachstate` / `_getdetachstate` / `_setinheritsched` / `_getinheritsched` / `_setschedpolicy` / `_getschedpolicy` / `_setschedparam` / `_getschedparam` / `_setstacksize` / `_getstacksize` / `_setstack` / `_getstack`. All functions return positive errno on failure (POSIX convention). Stack address selection is delegated to the kernel (shared-VA model); `pthread_attr_setstack` always returns `ENOTSUP`, and `pthread_attr_setstacksize` succeeds only for `USER_STACK_SIZE`, so callers do not observe a stack contract the kernel cannot honor. The accompanying `pthread_attr_resolve_create_syscall` and `pthread_attr_resolve_prio_arg` helpers produce the syscall number and a2 encoding for the future `pthread_create` wrapper. |
 | `pthread_spin_init` / `_lock` / `_trylock` / `_unlock` / `_destroy` | (none) | stubbed | Mazu has kernel-internal spinlocks, but no userspace-visible busy-wait primitive. The `_POSIX_SPIN_LOCKS` macro is therefore intentionally *not* defined and `_SC_SPIN_LOCKS` returns -1 — advertising it would let an app gate on the macro and call absent APIs. Expect a libc-side implementation backed by a futex once threads land, not a kernel syscall. |
 | `pthread_cancel` / `pthread_setcancelstate` / `pthread_testcancel` | `SYS_THREAD_CANCEL` / `SYS_THREAD_SETCANCELSTATE` / `SYS_THREAD_TESTCANCEL` | implemented | Deferred cancellation: pthread_cancel sets `td_cancel_pending`; the target observes the bit at the next cancellation point and exits with code -ECANCELED. ASYNC type is treated as DEFERRED because Mazu has no in-kernel cancellation points other than blocking syscalls. |
 
@@ -270,8 +264,10 @@ work. They are part of the product, not optional compatibility extensions.
 
 The bounded multi-threaded process model is in place: per-thread
 state migration (signal pending/blocked, signal-frame chain, robust
-futex list, errno TLS) and the user-visible pthread surface
-(`SYS_THREAD_CREATE` and friends) have both landed, with
-`PROC_THREAD_MAX = 4`. The remaining gap is the `pthread_attr_*`
-libc family (strictly a libc-side concern; the kernel ABI already
-accepts the resolved (entry, arg, prio) tuple).
+futex list, errno TLS), the user-visible pthread surface
+(`SYS_THREAD_CREATE` and friends, `PROC_THREAD_MAX = 4`), and the
+`pthread_attr_*` library have all landed. A future user-mode
+`pthread_create` wrapper can honor `PTHREAD_EXPLICIT_SCHED` without
+the `SETSCHEDPARAM`-after-create race window by switching from
+`SYS_THREAD_CREATE` to `SYS_THREAD_CREATE_EXPLICIT` and passing the
+resolved priority in a2 as (prio + 1).

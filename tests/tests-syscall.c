@@ -1859,7 +1859,9 @@ static i32 selftest_sigqueue_abi_numbering(void)
                   "SYS_CAP_REVOKE_DELEGATE must stay at 98");
     static_assert(SYS_CAP_GET_TOKEN == 99, "SYS_CAP_GET_TOKEN must stay at 99");
     static_assert(SYS_SIGQUEUE == 100, "SYS_SIGQUEUE must be appended at 100");
-    static_assert(SYS_NR == 101, "SYS_NR must stay at 101");
+    static_assert(SYS_THREAD_CREATE_EXPLICIT == 101,
+                  "SYS_THREAD_CREATE_EXPLICIT must be appended at 101");
+    static_assert(SYS_NR == 102, "SYS_NR must stay at 102");
     return 0;
 }
 DEFINE_SELFTEST(sigqueue_abi_numbering, selftest_sigqueue_abi_numbering);
