@@ -10,6 +10,7 @@
 
 #include <isr.h>
 #include <mazu/errordef.h>
+#include <mazu/posix_time.h>
 #include <mazu/proc.h>
 #include <mazu/sched.h>
 #include <mazu/uaccess.h>
@@ -209,6 +210,8 @@ static inline i32 wait_abort_error_current(void)
 
     if (thread_cancel_enabled_pending(td))
         return -(i32) ECANCELED;
+    if (td && realtime_clock_wait_should_restart(td))
+        return MAZU_WAIT_ABORT_CLOCK_SETTIME;
     if (td && td->proc && signal_has_deliverable(td))
         return -(i32) EINTR;
     return 0;

@@ -5,6 +5,13 @@
  * FUTEX_WAIT atomically checks the user word and blocks;
  * FUTEX_WAKE wakes waiters on the same address.
  *
+ * PI futexes maintain explicit owner state in the kernel so contended
+ * FUTEX_LOCK_PI can donate priority to the current owner, unlock can
+ * hand ownership directly to the highest-priority waiter, robust exit
+ * can clear stale donation on owner death, and FUTEX_CMP_REQUEUE_PI
+ * can move condvar-style waiters onto the destination mutex while
+ * preserving PI donation.
+ *
  * Lock ordering: futex bucket lock (WAITQ) -> pcpu_runq_lock (SCHED).
  */
 
@@ -13,11 +20,16 @@
 
 #include <mazu/base.h>
 
+struct proc;
+struct sched_task;
+struct futex_pi_state;
+
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
 #define FUTEX_CMP_REQUEUE 2
 #define FUTEX_LOCK_PI 3
 #define FUTEX_UNLOCK_PI 4
+#define FUTEX_CMP_REQUEUE_PI 5
 
 /* Initialize the futex hash table.  Called once at boot. */
 void futex_init(void);
@@ -43,9 +55,24 @@ i64 futex_cmp_requeue(ptr uaddr1,
                       u32 nr_wake,
                       u32 nr_requeue);
 
-/* FUTEX_LOCK_PI: acquire PI-aware futex.  Blocks with priority
- * inheritance if the futex is held by another task.
- * Returns 0 on acquisition, -EFAULT on bad pointer.
+/* FUTEX_CMP_REQUEUE_PI: wake up to nr_wake waiters on uaddr1, then move
+ * up to nr_requeue remaining waiters from uaddr1 to uaddr2 while preserving
+ * PI donation toward uaddr2's current owner when one exists.
+ */
+i64 futex_cmp_requeue_pi(ptr uaddr1,
+                         u32 expected,
+                         ptr uaddr2,
+                         u32 nr_wake,
+                         u32 nr_requeue);
+
+/* FUTEX_LOCK_PI: acquire PI-aware futex.  Blocks if the futex is held
+ * by another task, donates waiter priority to the owner while queued,
+ * and preserves FUTEX_OWNER_DIED in the futex word when a robust-exit
+ * handoff left recovery state for user space to observe.
+ * Returns 0 on acquisition, -EOWNERDEAD when the previous owner died
+ * holding the lock (caller now owns it but the protected state is
+ * presumed inconsistent until pthread_mutex_consistent runs), -EFAULT
+ * on bad pointer.
  */
 i64 futex_lock_pi(ptr uaddr);
 
@@ -54,12 +81,16 @@ i64 futex_lock_pi(ptr uaddr);
  */
 i64 futex_unlock_pi(ptr uaddr);
 
-/* Walk the robust futex list of a dying process and unlock orphaned
- * futexes.  Called from the process exit path.  Writes 0 to each
- * futex word and wakes one waiter per entry.
+/* Refresh the cached top waiter priority for a contended PI futex and return
+ * its current owner so transitive donation can continue upstream.
  */
-struct proc;
-struct sched_task;
+struct sched_task *futex_pi_refresh_wait_chain(struct futex_pi_state *st);
+
+/* Walk the robust futex list of a dying process and unlock orphaned
+ * futexes.  Called from the process exit path.  Writes
+ * FUTEX_OWNER_DIED to each futex word, drops any stale PI donation,
+ * and wakes one waiter per entry.
+ */
 void futex_exit_robust_list(struct proc *p);
 
 /* Walk one thread's robust futex list and clear its registration.

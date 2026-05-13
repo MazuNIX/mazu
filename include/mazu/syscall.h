@@ -194,8 +194,12 @@
  */
 #define SYS_SIGQUEUE 100
 #define SYS_THREAD_CREATE_EXPLICIT 101
+#define SYS_CLOCK_NANOSLEEP 102
+#define SYS_MUTEX_TIMEDLOCK 103
+#define SYS_MQ_TIMEDSEND 104
+#define SYS_CLOCK_SETTIME 105
 
-#define SYS_NR 102 /* total number of syscalls */
+#define SYS_NR 106 /* total number of syscalls */
 
 /* pthread_setcancelstate state values. */
 #define PTHREAD_CANCEL_ENABLE 0
@@ -207,6 +211,11 @@
 #define SCHED_OTHER 0
 #define SCHED_FIFO 1
 #define SCHED_RR 2
+
+/* Minimal open(2) flag subset used by the current kernel ABI. */
+#define O_RDONLY 0
+#define O_DSYNC 0x1000
+#define O_SYNC 0x2000
 
 #ifndef __ASSEMBLER__
 

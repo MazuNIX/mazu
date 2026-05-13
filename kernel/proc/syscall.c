@@ -50,6 +50,95 @@ static i64 cancel_thread_now(struct trap_frame *tf, struct sched_task *td);
 static i64 maybe_cancel_at_cancellation_point(struct trap_frame *tf,
                                               struct sched_task *td,
                                               i64 rc);
+static i64 timed_wait_abs_to_rel(i32 clk_id,
+                                 ptr u_abs_ts,
+                                 struct time_ms *out_ms);
+static i64 timed_wait_recheck_realtime_deadline(ptr u_abs_ts,
+                                                struct time_ms *out_ms);
+static spinlock_t realtime_clock_lock = SPINLOCK_INITIALIZER;
+static struct timespec realtime_clock_offset;
+static spinlock_t realtime_clock_wait_lock = SPINLOCK_INITIALIZER;
+static LIST_HEAD(realtime_clock_waiters);
+static u32 realtime_clock_wait_seq = 1;
+
+static void timespec_normalize(struct timespec *ts)
+{
+    while (ts->tv_nsec >= NSEC_PER_SEC) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= NSEC_PER_SEC;
+    }
+    while (ts->tv_nsec < 0) {
+        ts->tv_sec -= 1;
+        ts->tv_nsec += NSEC_PER_SEC;
+    }
+}
+
+static i64 monotonic_clock_now(struct timespec *out)
+{
+    u64 ticks = time_rdtime();
+    u64 freq = time_get_timebase_freq();
+    if (freq == 0)
+        return -(i64) EIO;
+    out->tv_sec = (i64) (ticks / freq);
+    out->tv_nsec = (i64) ((ticks % freq) * NSEC_PER_SEC / freq);
+    return 0;
+}
+
+static struct timespec realtime_offset_snapshot(void)
+{
+    u64 flags = spin_lock_irqsave(&realtime_clock_lock);
+    struct timespec off = realtime_clock_offset;
+    spin_unlock_irqrestore(&realtime_clock_lock, flags);
+    return off;
+}
+
+static i64 realtime_clock_now(struct timespec *out)
+{
+    i64 rc = monotonic_clock_now(out);
+    if (rc < 0)
+        return rc;
+    struct timespec off = realtime_offset_snapshot();
+    out->tv_sec += off.tv_sec;
+    out->tv_nsec += off.tv_nsec;
+    timespec_normalize(out);
+    return 0;
+}
+
+void realtime_clock_wait_begin(struct sched_task *td)
+{
+    if (!td)
+        return;
+
+    u64 flags = spin_lock_irqsave(&realtime_clock_wait_lock);
+    if (!td->td_realtime_wait_active) {
+        list_init(&td->td_realtime_wait_node);
+        list_add_tail(&realtime_clock_waiters, &td->td_realtime_wait_node);
+        td->td_realtime_wait_active = true;
+    }
+    td->td_realtime_wait_seq =
+        __atomic_load_n(&realtime_clock_wait_seq, __ATOMIC_ACQUIRE);
+    spin_unlock_irqrestore(&realtime_clock_wait_lock, flags);
+}
+
+void realtime_clock_wait_end(struct sched_task *td)
+{
+    if (!td)
+        return;
+
+    u64 flags = spin_lock_irqsave(&realtime_clock_wait_lock);
+    if (td->td_realtime_wait_active) {
+        list_del_init(&td->td_realtime_wait_node);
+        td->td_realtime_wait_active = false;
+    }
+    spin_unlock_irqrestore(&realtime_clock_wait_lock, flags);
+}
+
+bool realtime_clock_wait_should_restart(const struct sched_task *td)
+{
+    return td && td->td_realtime_wait_active &&
+           __atomic_load_n(&realtime_clock_wait_seq, __ATOMIC_ACQUIRE) !=
+               td->td_realtime_wait_seq;
+}
 
 /* Copy a user-space path into kpath[257].  Returns the kernel str on success,
  * or sets *err to a negative errno and returns an empty str.
@@ -75,6 +164,19 @@ static struct str copy_user_path(ptr upath, sz pathlen, char *kpath, i64 *err)
 static inline bool validate_fd_number(i32 fd)
 {
     return fd >= 0 && fd < PROC_FD_MAX;
+}
+
+static i64 validate_open_flags(u64 raw_flags, u32 *out_flags)
+{
+    const u32 supported = O_SYNC | O_DSYNC;
+
+    if (raw_flags > (u64) U32_MAX)
+        return -(i64) EINVAL;
+    u32 flags = (u32) raw_flags;
+    if ((flags & ~supported) != 0)
+        return -(i64) EINVAL;
+    *out_flags = flags;
+    return 0;
 }
 
 static i64 sys_exit(struct trap_frame *tf, struct sched_task *td)
@@ -302,6 +404,7 @@ static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
 {
     ptr upath = (ptr) tf->a0;
     sz pathlen = (sz) tf->a1;
+    u32 open_flags;
 
     struct proc *p = td->proc;
     if (!p)
@@ -315,6 +418,10 @@ static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
     struct str path = copy_user_path(upath, pathlen, kpath, &perr);
     if (perr < 0)
         return perr;
+
+    i64 rc = validate_open_flags(tf->a2, &open_flags);
+    if (rc < 0)
+        return rc;
 
     struct result_vfs_stat st = vfs_stat(path);
     if (st.is_error)
@@ -333,7 +440,7 @@ static i64 sys_open(struct trap_frame *tf, struct sched_task *td)
     if (fres.is_error)
         return -(i64) fres.code;
     return (i64) cap_open_vfs(p, result_vfs_file_checked(fres), rights,
-                              is_seekable, -1, false);
+                              is_seekable, open_flags, -1, false);
 }
 
 static i64 sys_close(struct trap_frame *tf, struct sched_task *td)
@@ -771,6 +878,13 @@ static i64 sys_futex(struct trap_frame *tf, struct sched_task *td)
             return -(i64) EINVAL;
         return futex_cmp_requeue(uaddr, val, uaddr2, 1, nr_requeue);
     }
+    case FUTEX_CMP_REQUEUE_PI: {
+        ptr uaddr2 = (ptr) tf->a3;
+        u32 nr_requeue = (u32) tf->a4;
+        if (!futex_addr_valid(uaddr2))
+            return -(i64) EINVAL;
+        return futex_cmp_requeue_pi(uaddr, val, uaddr2, 1, nr_requeue);
+    }
     case FUTEX_LOCK_PI:
         return maybe_cancel_at_cancellation_point(tf, td, futex_lock_pi(uaddr));
     case FUTEX_UNLOCK_PI:
@@ -883,9 +997,14 @@ i64 sys_sysconf_query(i64 name)
         return (i64) _POSIX_CPUTIME;
     case _SC_REALTIME_SIGNALS:
         return (i64) _POSIX_REALTIME_SIGNALS;
-    case _SC_SPIN_LOCKS: /* fall through; userspace surface absent */
     case _SC_CLOCK_SELECTION:
-        return -1; /* feature not implemented (POSIX-style negative reply) */
+        return (i64) _POSIX_CLOCK_SELECTION;
+    case _SC_TIMEOUTS:
+        return (i64) _POSIX_TIMEOUTS;
+    case _SC_SYNCHRONIZED_IO:
+        return (i64) _POSIX_SYNCHRONIZED_IO;
+    case _SC_SPIN_LOCKS:
+        return -1; /* feature intentionally absent */
     default:
         return -(i64) EINVAL;
     }
@@ -1199,12 +1318,10 @@ static i64 sys_clock_gettime(struct trap_frame *tf, struct sched_task *td)
         ts.tv_sec = (i64) (us / 1000000ULL);
         ts.tv_nsec = (i64) ((us % 1000000ULL) * (u64) NSEC_PER_USEC);
     } else {
-        u64 ticks = time_rdtime();
-        u64 freq = time_get_timebase_freq();
-        if (freq == 0)
-            return -(i64) EIO;
-        ts.tv_sec = (i64) (ticks / freq);
-        ts.tv_nsec = (i64) ((ticks % freq) * NSEC_PER_SEC / freq);
+        i64 rc = (clk_id == CLOCK_REALTIME) ? realtime_clock_now(&ts)
+                                            : monotonic_clock_now(&ts);
+        if (rc < 0)
+            return rc;
     }
 
     i64 rc = copy_to_user(u_ts, &ts, sizeof(ts));
@@ -1241,17 +1358,66 @@ static i64 sys_clock_getres(struct trap_frame *tf,
     return 0;
 }
 
-static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
+static i64 sys_clock_settime(struct trap_frame *tf, struct sched_task *td)
 {
-    ptr u_req = (ptr) tf->a0;
-    ptr u_rem = (ptr) tf->a1;
+    (void) td;
+    i32 clk_id = (i32) tf->a0;
+    ptr u_ts = (ptr) tf->a1;
 
-    struct timespec req;
-    i64 rc = copy_from_user(&req, u_req, sizeof(req));
+    if (clk_id != CLOCK_REALTIME)
+        return -(i64) EINVAL;
+
+    struct timespec ts;
+    i64 rc = copy_from_user(&ts, u_ts, sizeof(ts));
+    if (rc < 0)
+        return rc;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC)
+        return -(i64) EINVAL;
+    /* Bound the wall-clock seed so future realtime_clock_now reads
+     * (offset.tv_sec + monotonic.tv_sec) cannot overflow i64 once the
+     * monotonic clock advances.  2^62 seconds is roughly 1.46e11 years,
+     * which preserves any sane wall-clock value while leaving an entire
+     * half-range for monotonic accumulation.
+     */
+    if (ts.tv_sec > (i64) ((u64) 1 << 62))
+        return -(i64) EINVAL;
+
+    struct timespec mono_now;
+    rc = monotonic_clock_now(&mono_now);
     if (rc < 0)
         return rc;
 
-    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= NSEC_PER_SEC)
+    struct timespec off = {
+        .tv_sec = ts.tv_sec - mono_now.tv_sec,
+        .tv_nsec = ts.tv_nsec - mono_now.tv_nsec,
+    };
+    timespec_normalize(&off);
+
+    u64 flags = spin_lock_irqsave(&realtime_clock_lock);
+    realtime_clock_offset = off;
+    spin_unlock_irqrestore(&realtime_clock_lock, flags);
+
+    flags = spin_lock_irqsave(&realtime_clock_wait_lock);
+    u32 next_seq = realtime_clock_wait_seq + 1;
+    if (next_seq == 0)
+        next_seq = 1;
+    __atomic_store_n(&realtime_clock_wait_seq, next_seq, __ATOMIC_RELEASE);
+    struct sched_task *it;
+    list_for_each_entry_safe (&realtime_clock_waiters, it, struct sched_task,
+                              td_realtime_wait_node) {
+        sched_wake_ready(it);
+    }
+    spin_unlock_irqrestore(&realtime_clock_wait_lock, flags);
+    return 0;
+}
+
+static i64 nanosleep_common(struct trap_frame *tf,
+                            struct sched_task *td,
+                            const struct timespec *req,
+                            ptr u_rem,
+                            bool write_rem_on_eintr)
+{
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= NSEC_PER_SEC)
         return -(i64) EINVAL;
 
     /* Bound user-controlled tv_sec so neither the ns nor ms conversion
@@ -1260,7 +1426,7 @@ static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
      * passing tv_sec near INT64_MAX (which would otherwise wrap req_ns
      * and silently turn a multi-decade sleep into a near-zero one).
      */
-    if ((u64) req.tv_sec > U64_MAX / (u64) NSEC_PER_SEC)
+    if ((u64) req->tv_sec > U64_MAX / (u64) NSEC_PER_SEC)
         return -(i64) EINVAL;
 
     /* Capture the requested duration in raw ticks so the remainder we
@@ -1271,9 +1437,9 @@ static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
     u64 freq = time_get_timebase_freq();
     if (freq == 0)
         return -(i64) EIO;
-    u64 req_ns = (u64) req.tv_sec * (u64) NSEC_PER_SEC + (u64) req.tv_nsec;
-    u64 ms = (u64) req.tv_sec * 1000 + (u64) req.tv_nsec / NSEC_PER_MSEC;
-    if (ms == 0 && req.tv_nsec > 0)
+    u64 req_ns = (u64) req->tv_sec * (u64) NSEC_PER_SEC + (u64) req->tv_nsec;
+    u64 ms = (u64) req->tv_sec * 1000 + (u64) req->tv_nsec / NSEC_PER_MSEC;
+    if (ms == 0 && req->tv_nsec > 0)
         ms = 1; /* sub-millisecond: round up to one tick */
 
     if (thread_cancel_enabled_pending(td))
@@ -1305,8 +1471,11 @@ static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
     if (thread_cancel_enabled_pending(td))
         return cancel_thread_now(tf, td);
 
+    if (td && realtime_clock_wait_should_restart(td) && elapsed_ns < req_ns)
+        return (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME;
+
     if (td && signal_has_deliverable(td) && elapsed_ns < req_ns) {
-        if (u_rem) {
+        if (write_rem_on_eintr && u_rem) {
             u64 rem_ns = req_ns - elapsed_ns;
             struct timespec rem = {
                 .tv_sec = (i64) (rem_ns / (u64) NSEC_PER_SEC),
@@ -1319,6 +1488,16 @@ static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
 
     /* Normal completion: POSIX/Linux leave *rem unmodified. */
     return 0;
+}
+
+static i64 sys_nanosleep(struct trap_frame *tf, struct sched_task *td)
+{
+    ptr u_req = (ptr) tf->a0;
+    struct timespec req;
+    i64 rc = copy_from_user(&req, u_req, sizeof(req));
+    if (rc < 0)
+        return rc;
+    return nanosleep_common(tf, td, &req, (ptr) tf->a1, true);
 }
 
 /* --- PSE51 memory locking: no-ops on bare metal --- */
@@ -1447,6 +1626,58 @@ static i64 sys_mutex_trylock_h(struct trap_frame *tf,
     return rc;
 }
 
+static i64 sys_mutex_timedlock_h(struct trap_frame *tf,
+                                 struct sched_task *td __unused)
+{
+    i32 handle = (i32) tf->a0;
+    ptr u_abs_ts = (ptr) tf->a1;
+    i64 rc;
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MUTEX);
+    if (!ref.type)
+        return -(i64) EINVAL;
+    struct pi_mutex *mtx = sync_mutex_get((i32) ref.object_index);
+    if (!mtx) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = (i64) pi_mutex_trylock(mtx);
+    if (rc == 0)
+        goto out;
+    if (rc != -(i64) EBUSY)
+        goto out;
+
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) pi_mutex_lock_timed(mtx, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc = timed_wait_recheck_realtime_deadline(u_abs_ts, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
+out:
+    cap_put_ref(&ref);
+    return rc;
+}
+
 static i64 sys_mutex_unlock_h(struct trap_frame *tf,
                               struct sched_task *td __unused)
 {
@@ -1532,12 +1763,12 @@ out:
  */
 /* Convert a user-supplied absolute timespec on the named clock to a
  * relative time_ms suitable for the kernel's monotonic timed-wait
- * primitives.  Today CLOCK_MONOTONIC and CLOCK_REALTIME share the
- * same epoch, so the conversion is identity; the clk_id parameter
- * is plumbed so adding a real RTC offset later is a one-place change
- * rather than a silent semantic break for every caller.  Returns 0
- * on success, -ETIMEDOUT if the deadline already passed,
- * -EINVAL / -EFAULT / -EIO on bad input.
+ * primitives. CLOCK_REALTIME snapshots the current realtime offset at
+ * conversion time; callers that want full POSIX absolute-realtime
+ * semantics across concurrent SYS_CLOCK_SETTIME changes must register
+ * for restart and recompute after wakeup. Returns 0 on success,
+ * -ETIMEDOUT if the deadline already passed, -EINVAL / -EFAULT / -EIO
+ * on bad input.
  */
 static i64 timed_wait_abs_to_rel(i32 clk_id,
                                  ptr u_abs_ts,
@@ -1546,10 +1777,13 @@ static i64 timed_wait_abs_to_rel(i32 clk_id,
     if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
         return -(i64) EINVAL;
 
-    if (!u_abs_ts) {
-        *out_ms = time_ms_new(TIME_MS_MAX);
-        return 0;
-    }
+    /* POSIX timed waits (pthread_*_timed*, sem_timedwait, mq_timed*,
+     * clock_nanosleep with TIMER_ABSTIME) require a non-NULL abstime.
+     * Reject NULL so callers cannot silently turn a timed wait into an
+     * infinite wait that would mask a missing argument.
+     */
+    if (!u_abs_ts)
+        return -(i64) EINVAL;
     struct timespec abs;
     i64 rc = copy_from_user(&abs, u_abs_ts, sizeof(abs));
     if (rc < 0)
@@ -1560,24 +1794,18 @@ static i64 timed_wait_abs_to_rel(i32 clk_id,
     u64 freq = time_get_timebase_freq();
     if (freq == 0)
         return -(i64) EIO;
-    u64 now_ticks = time_rdtime();
-    u64 now_sec = now_ticks / freq;
-    u64 now_nsec = (now_ticks % freq) * (u64) NSEC_PER_SEC / freq;
+    struct timespec now;
+    rc = (clk_id == CLOCK_REALTIME) ? realtime_clock_now(&now)
+                                    : monotonic_clock_now(&now);
+    if (rc < 0)
+        return rc;
 
-    /* CLOCK_REALTIME translation hook: today the realtime clock is
-     * anchored to the same monotonic ticks, so no offset is applied.
-     * If/when a real wall-clock offset lands, subtract it here for
-     * CLOCK_REALTIME and translate the user deadline back into the
-     * monotonic timebase.
-     */
-    (void) clk_id; /* placeholder; see comment above */
-
-    if ((u64) abs.tv_sec < now_sec ||
-        ((u64) abs.tv_sec == now_sec && (u64) abs.tv_nsec <= now_nsec))
+    if (abs.tv_sec < now.tv_sec ||
+        (abs.tv_sec == now.tv_sec && abs.tv_nsec <= now.tv_nsec))
         return -(i64) ETIMEDOUT;
 
-    u64 diff_sec = (u64) abs.tv_sec - now_sec;
-    i64 diff_nsec = abs.tv_nsec - (i64) now_nsec;
+    u64 diff_sec = (u64) (abs.tv_sec - now.tv_sec);
+    i64 diff_nsec = abs.tv_nsec - now.tv_nsec;
     if (diff_nsec < 0) {
         diff_sec -= 1;
         diff_nsec += NSEC_PER_SEC;
@@ -1593,16 +1821,110 @@ static i64 timed_wait_abs_to_rel(i32 clk_id,
     return 0;
 }
 
+static i64 timed_wait_recheck_realtime_deadline(ptr u_abs_ts,
+                                                struct time_ms *out_ms)
+{
+    return timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, out_ms);
+}
+
+/* Convert an absolute deadline on clk_id to a relative timespec without
+ * rounding through milliseconds.  Round-tripping through u64 ms wraps for
+ * deadlines beyond ~584 million years and would silently turn a long sleep
+ * into a tiny one; computing the delta as a timespec preserves nanosecond
+ * precision and lets nanosleep_common saturate using its own bounds.
+ * Returns 0 with *already_elapsed = true when the deadline has already
+ * passed (caller should treat as success with zero remaining), or a
+ * negative errno on bad input.
+ */
+static i64 abs_deadline_to_rel_timespec(i32 clk_id,
+                                        ptr u_abs_ts,
+                                        struct timespec *out_rel,
+                                        bool *already_elapsed)
+{
+    *already_elapsed = false;
+    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
+        return -(i64) EINVAL;
+    if (!u_abs_ts)
+        return -(i64) EINVAL;
+
+    struct timespec abs;
+    i64 rc = copy_from_user(&abs, u_abs_ts, sizeof(abs));
+    if (rc < 0)
+        return rc;
+    if (abs.tv_sec < 0 || abs.tv_nsec < 0 || abs.tv_nsec >= NSEC_PER_SEC)
+        return -(i64) EINVAL;
+
+    struct timespec now;
+    rc = (clk_id == CLOCK_REALTIME) ? realtime_clock_now(&now)
+                                    : monotonic_clock_now(&now);
+    if (rc < 0)
+        return rc;
+
+    if (abs.tv_sec < now.tv_sec ||
+        (abs.tv_sec == now.tv_sec && abs.tv_nsec <= now.tv_nsec)) {
+        *already_elapsed = true;
+        out_rel->tv_sec = 0;
+        out_rel->tv_nsec = 0;
+        return 0;
+    }
+
+    out_rel->tv_sec = abs.tv_sec - now.tv_sec;
+    out_rel->tv_nsec = abs.tv_nsec - now.tv_nsec;
+    if (out_rel->tv_nsec < 0) {
+        out_rel->tv_sec -= 1;
+        out_rel->tv_nsec += NSEC_PER_SEC;
+    }
+    return 0;
+}
+
+static i64 sys_clock_nanosleep(struct trap_frame *tf, struct sched_task *td)
+{
+    i32 clk_id = (i32) tf->a0;
+    u64 flags = tf->a1;
+    ptr u_req = (ptr) tf->a2;
+    ptr u_rem = (ptr) tf->a3;
+
+    if ((flags & ~((u64) TIMER_ABSTIME)) != 0)
+        return -(i64) EINVAL;
+
+    if ((flags & TIMER_ABSTIME) != 0) {
+        for (;;) {
+            struct timespec rel;
+            bool already_elapsed = false;
+            i64 rc = abs_deadline_to_rel_timespec(clk_id, u_req, &rel,
+                                                  &already_elapsed);
+            if (rc < 0)
+                return rc;
+            if (already_elapsed)
+                return 0;
+            if (clk_id == CLOCK_REALTIME)
+                realtime_clock_wait_begin(td);
+            rc = nanosleep_common(tf, td, &rel, u_rem, false);
+            if (clk_id == CLOCK_REALTIME)
+                realtime_clock_wait_end(td);
+            if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+                continue;
+            return rc;
+        }
+    }
+
+    if (clk_id != CLOCK_MONOTONIC && clk_id != CLOCK_REALTIME)
+        return -(i64) EINVAL;
+
+    struct timespec req;
+    i64 rc = copy_from_user(&req, u_req, sizeof(req));
+    if (rc < 0)
+        return rc;
+    return nanosleep_common(tf, td, &req, u_rem, true);
+}
+
 static i64 sys_cond_timedwait_h(struct trap_frame *tf,
                                 struct sched_task *td __unused)
 {
     i32 cv_h = (i32) tf->a0;
     i32 mtx_h = (i32) tf->a1;
     ptr u_abs_ts = (ptr) tf->a2;
-    struct time_ms timeout;
-    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
-    if (rc < 0)
-        return rc;
+    i64 rc;
     struct cap_ref cv_ref =
         cap_lookup_object(td->proc, cv_h, CAP_RIGHT_WRITE, CAP_TYPE_CONDVAR);
     if (!cv_ref.type)
@@ -1623,8 +1945,28 @@ static i64 sys_cond_timedwait_h(struct trap_frame *tf,
         rc = cancel_thread_now(tf, td);
         goto out;
     }
-    rc = maybe_cancel_at_cancellation_point(
-        tf, td, (i64) condvar_wait_timeout(cv, mtx, timeout));
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) condvar_wait_timeout(cv, mtx, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc = timed_wait_recheck_realtime_deadline(u_abs_ts, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
 out:
     cap_put_ref(&mtx_ref);
     cap_put_ref(&cv_ref);
@@ -1734,14 +2076,11 @@ static i64 sys_sem_timedwait_h(struct trap_frame *tf,
 {
     i32 handle = (i32) tf->a0;
     ptr u_abs_ts = (ptr) tf->a1;
-    struct time_ms timeout;
-    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
-    if (rc < 0)
-        return rc;
     struct cap_ref ref = cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE,
                                            CAP_TYPE_SEMAPHORE);
     if (!ref.type)
         return -(i64) EINVAL;
+    i64 rc;
     struct semaphore *s = sync_sem_get((i32) ref.object_index);
     if (!s) {
         rc = -(i64) EINVAL;
@@ -1751,8 +2090,33 @@ static i64 sys_sem_timedwait_h(struct trap_frame *tf,
         rc = cancel_thread_now(tf, td);
         goto out;
     }
-    rc = maybe_cancel_at_cancellation_point(tf, td,
-                                            (i64) sem_timedwait(s, timeout));
+    rc = (i64) sem_trywait(s);
+    if (rc == 0)
+        goto out;
+    if (rc != -(i64) EAGAIN)
+        goto out;
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) sem_timedwait(s, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc = timed_wait_recheck_realtime_deadline(u_abs_ts, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
 out:
     cap_put_ref(&ref);
     return rc;
@@ -1940,14 +2304,11 @@ static i64 sys_rwlock_timedrdlock_h(struct trap_frame *tf,
 {
     i32 handle = (i32) tf->a0;
     ptr u_abs_ts = (ptr) tf->a1;
-    struct time_ms timeout;
-    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
-    if (rc < 0)
-        return rc;
     struct cap_ref ref =
         cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
     if (!ref.type)
         return -(i64) EINVAL;
+    i64 rc;
     struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
     if (!rw) {
         rc = -(i64) EINVAL;
@@ -1957,8 +2318,33 @@ static i64 sys_rwlock_timedrdlock_h(struct trap_frame *tf,
         rc = cancel_thread_now(tf, td);
         goto out;
     }
-    rc = maybe_cancel_at_cancellation_point(
-        tf, td, (i64) rwlock_timedrdlock(rw, timeout));
+    rc = (i64) rwlock_tryrdlock(rw);
+    if (rc == 0)
+        goto out;
+    if (rc != -(i64) EBUSY)
+        goto out;
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) rwlock_timedrdlock(rw, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc = timed_wait_recheck_realtime_deadline(u_abs_ts, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
 out:
     cap_put_ref(&ref);
     return rc;
@@ -1969,14 +2355,11 @@ static i64 sys_rwlock_timedwrlock_h(struct trap_frame *tf,
 {
     i32 handle = (i32) tf->a0;
     ptr u_abs_ts = (ptr) tf->a1;
-    struct time_ms timeout;
-    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
-    if (rc < 0)
-        return rc;
     struct cap_ref ref =
         cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_RWLOCK);
     if (!ref.type)
         return -(i64) EINVAL;
+    i64 rc;
     struct rwlock *rw = sync_rwlock_get((i32) ref.object_index);
     if (!rw) {
         rc = -(i64) EINVAL;
@@ -1986,8 +2369,33 @@ static i64 sys_rwlock_timedwrlock_h(struct trap_frame *tf,
         rc = cancel_thread_now(tf, td);
         goto out;
     }
-    rc = maybe_cancel_at_cancellation_point(
-        tf, td, (i64) rwlock_timedwrlock(rw, timeout));
+    rc = (i64) rwlock_trywrlock(rw);
+    if (rc == 0)
+        goto out;
+    if (rc != -(i64) EBUSY)
+        goto out;
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, u_abs_ts, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) rwlock_timedwrlock(rw, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc = timed_wait_recheck_realtime_deadline(u_abs_ts, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
 out:
     cap_put_ref(&ref);
     return rc;
@@ -2041,7 +2449,7 @@ static i64 sys_mq_close(struct trap_frame *tf, struct sched_task *td)
     i32 handle = (i32) tf->a0;
     struct cap_slot_view slot;
     if (!cap_lookup_slot(td->proc, handle, 0, CAP_TYPE_MQUEUE, &slot))
-        return -(i64) EINVAL;
+        return -(i64) EBADF;
     return cap_drop_token(td->proc, cap_make_handle(&slot));
 }
 
@@ -2051,19 +2459,26 @@ static i64 sys_mq_send(struct trap_frame *tf, struct sched_task *td)
     struct cap_ref ref =
         cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MQUEUE);
     if (!ref.type)
-        return -(i64) EINVAL;
+        return -(i64) EBADF;
     ptr u_msg = (ptr) tf->a1;
     sz len = (sz) tf->a2;
     u32 priority = (u32) tf->a3;
     i64 rc;
 
-    if (len <= 0 || len > MQ_MAX_MSG_SIZE) {
+    /* POSIX allows zero-length messages; sub-range priorities map to
+     * MQ_PRIO_MAX-1 maximum.  Oversize payload remains EMSGSIZE.
+     */
+    if (len < 0 || len > MQ_MAX_MSG_SIZE) {
         rc = -(i64) EMSGSIZE;
+        goto out;
+    }
+    if (priority >= MQ_PRIO_MAX) {
+        rc = -(i64) EINVAL;
         goto out;
     }
 
     u8 kbuf[MQ_MAX_MSG_SIZE];
-    rc = copy_from_user(kbuf, u_msg, len);
+    rc = len > 0 ? copy_from_user(kbuf, u_msg, len) : 0;
     if (rc < 0)
         goto out;
 
@@ -2092,18 +2507,40 @@ static i64 mq_receive_common(struct trap_frame *tf,
                              bool timed,
                              struct time_ms timeout)
 {
-    if (buf_size <= 0 || buf_size > MQ_MAX_MSG_SIZE)
-        return -(i64) EINVAL;
+    /* POSIX requires the user buffer to be at least mq_msgsize for the
+     * queue, so a too-small buffer fails before any message is dequeued
+     * regardless of the current head message length.  Oversized buffers
+     * are accepted; we copy only the actual message bytes back out.
+     */
+    if (buf_size < 0)
+        return -(i64) EMSGSIZE;
+    sz msgsize = mqueue_get_msgsize((i32) ref->object_index);
+    if (msgsize < 0)
+        return -(i64) EBADF;
+    if (buf_size < msgsize)
+        return -(i64) EMSGSIZE;
+    /* Kernel-side scratch is bounded by MQ_MAX_MSG_SIZE.  mqueue_open
+     * already caps max_msg_size at this value, so the dequeue fits.
+     */
+    sz dequeue_size =
+        msgsize > MQ_MAX_MSG_SIZE ? (sz) MQ_MAX_MSG_SIZE : msgsize;
 
     if (thread_cancel_enabled_pending(td))
         return cancel_thread_now(tf, td);
 
     u8 kbuf[MQ_MAX_MSG_SIZE];
     u32 prio = 0;
-    i32 ret =
-        timed ? mqueue_timedreceive((i32) ref->object_index, kbuf, buf_size,
-                                    &prio, timeout)
-              : mqueue_receive((i32) ref->object_index, kbuf, buf_size, &prio);
+    i32 ret;
+    if (timed) {
+        ret = mqueue_tryreceive((i32) ref->object_index, kbuf, dequeue_size,
+                                &prio);
+        if (ret == -(i32) EAGAIN)
+            ret = mqueue_timedreceive((i32) ref->object_index, kbuf,
+                                      dequeue_size, &prio, timeout);
+    } else {
+        ret =
+            mqueue_receive((i32) ref->object_index, kbuf, dequeue_size, &prio);
+    }
     if (ret < 0)
         return maybe_cancel_at_cancellation_point(tf, td, (i64) ret);
 
@@ -2124,7 +2561,7 @@ static i64 sys_mq_receive(struct trap_frame *tf, struct sched_task *td)
     struct cap_ref ref =
         cap_lookup_object(td->proc, handle, CAP_RIGHT_READ, CAP_TYPE_MQUEUE);
     if (!ref.type)
-        return -(i64) EINVAL;
+        return -(i64) EBADF;
     i64 rc = mq_receive_common(tf, td, &ref, (ptr) tf->a1, (sz) tf->a2,
                                (ptr) tf->a3, false, (struct time_ms) {0});
     cap_put_ref(&ref);
@@ -2137,15 +2574,132 @@ static i64 sys_mq_timedreceive(struct trap_frame *tf, struct sched_task *td)
     struct cap_ref ref =
         cap_lookup_object(td->proc, handle, CAP_RIGHT_READ, CAP_TYPE_MQUEUE);
     if (!ref.type)
-        return -(i64) EINVAL;
-    struct time_ms timeout;
-    i64 rc = timed_wait_abs_to_rel(CLOCK_REALTIME, (ptr) tf->a4, &timeout);
-    if (rc < 0) {
+        return -(i64) EBADF;
+    i64 rc;
+    sz buf_size = (sz) tf->a2;
+    if (buf_size < 0) {
+        cap_put_ref(&ref);
+        return -(i64) EMSGSIZE;
+    }
+    sz msgsize = mqueue_get_msgsize((i32) ref.object_index);
+    if (msgsize < 0) {
+        cap_put_ref(&ref);
+        return -(i64) EBADF;
+    }
+    if (buf_size < msgsize) {
+        cap_put_ref(&ref);
+        return -(i64) EMSGSIZE;
+    }
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
         cap_put_ref(&ref);
         return rc;
     }
-    rc = mq_receive_common(tf, td, &ref, (ptr) tf->a1, (sz) tf->a2,
-                           (ptr) tf->a3, true, timeout);
+
+    sz dequeue_size =
+        msgsize > MQ_MAX_MSG_SIZE ? (sz) MQ_MAX_MSG_SIZE : msgsize;
+    u8 kbuf[MQ_MAX_MSG_SIZE];
+    u32 prio = 0;
+    i32 ret =
+        mqueue_tryreceive((i32) ref.object_index, kbuf, dequeue_size, &prio);
+    if (ret >= 0) {
+        rc = copy_to_user((ptr) tf->a1, kbuf, (sz) ret);
+        if (rc == 0 && (ptr) tf->a3)
+            rc = copy_to_user((ptr) tf->a3, &prio, sizeof(prio));
+        cap_put_ref(&ref);
+        return (rc < 0) ? rc : (i64) ret;
+    }
+    if (ret != -(i32) EAGAIN) {
+        cap_put_ref(&ref);
+        return (i64) ret;
+    }
+
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, (ptr) tf->a4, &timeout);
+        if (rc < 0)
+            break;
+        realtime_clock_wait_begin(td);
+        rc = mq_receive_common(tf, td, &ref, (ptr) tf->a1, buf_size,
+                               (ptr) tf->a3, true, timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc =
+                timed_wait_recheck_realtime_deadline((ptr) tf->a4, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT)
+                rc = rrc;
+        }
+        break;
+    }
+    cap_put_ref(&ref);
+    return rc;
+}
+
+static i64 sys_mq_timedsend(struct trap_frame *tf, struct sched_task *td)
+{
+    i32 handle = (i32) tf->a0;
+    struct cap_ref ref =
+        cap_lookup_object(td->proc, handle, CAP_RIGHT_WRITE, CAP_TYPE_MQUEUE);
+    if (!ref.type)
+        return -(i64) EBADF;
+    ptr u_msg = (ptr) tf->a1;
+    sz len = (sz) tf->a2;
+    u32 priority = (u32) tf->a3;
+    i64 rc;
+
+    if (len < 0 || len > MQ_MAX_MSG_SIZE) {
+        rc = -(i64) EMSGSIZE;
+        goto out;
+    }
+    if (priority >= MQ_PRIO_MAX) {
+        rc = -(i64) EINVAL;
+        goto out;
+    }
+
+    u8 kbuf[MQ_MAX_MSG_SIZE];
+    rc = len > 0 ? copy_from_user(kbuf, u_msg, len) : 0;
+    if (rc < 0)
+        goto out;
+
+    if (thread_cancel_enabled_pending(td)) {
+        rc = cancel_thread_now(tf, td);
+        goto out;
+    }
+    rc = (i64) mqueue_trysend((i32) ref.object_index, kbuf, len, priority);
+    if (rc == 0)
+        goto out;
+    if (rc != -(i64) EAGAIN)
+        goto out;
+
+    for (;;) {
+        struct time_ms timeout;
+        rc = timed_wait_abs_to_rel(CLOCK_REALTIME, (ptr) tf->a4, &timeout);
+        if (rc < 0)
+            goto out;
+        realtime_clock_wait_begin(td);
+        rc = (i64) mqueue_timedsend((i32) ref.object_index, kbuf, len, priority,
+                                    timeout);
+        realtime_clock_wait_end(td);
+        if (rc == (i64) MAZU_WAIT_ABORT_CLOCK_SETTIME)
+            continue;
+        if (rc == -(i64) ETIMEDOUT) {
+            i64 rrc =
+                timed_wait_recheck_realtime_deadline((ptr) tf->a4, &timeout);
+            if (rrc == 0)
+                continue;
+            if (rrc != -(i64) ETIMEDOUT) {
+                rc = rrc;
+                goto out;
+            }
+        }
+        break;
+    }
+    rc = maybe_cancel_at_cancellation_point(tf, td, rc);
+out:
     cap_put_ref(&ref);
     return rc;
 }
@@ -3089,14 +3643,16 @@ static i64 sys_thread_getschedparam_h(struct trap_frame *tf,
 }
 
 /* sched_setscheduler / sched_getscheduler. Mazu has one effective
- * policy (priority-based FIFO with EEVDF tiebreaker); SCHED_OTHER
- * and SCHED_RR are accepted but treated as SCHED_FIFO. The deadline
- * class has its own ABI (SYS_SCHED_SETATTR) and is not selectable
- * here.
+ * normal-thread policy: priority-dominated dispatch with quantum-based rotation
+ * among equal-priority runnable tasks. SCHED_OTHER and SCHED_RR are accepted
+ * but treated as SCHED_FIFO at the ABI boundary. When CONFIG_SCHED_EEVDF is
+ * enabled, EEVDF only changes which equal-priority task is picked next; it does
+ * not replace the quantum-driven rotation. The deadline class has its own ABI
+ * (SYS_SCHED_SETATTR) and is not selectable here.
  *
- * a0 = pid (0 = self), a1 = policy, a2 = priority. When a1==-1 the
- * call is a get rather than a set; the tristate keeps the syscall
- * count flat and matches glibc's pthread thin wrappers.
+ * a0 = pid (0 = self), a1 = policy, a2 = priority. When a1==-1 the call is a
+ * get rather than a set; the tristate keeps the syscall count flat and matches
+ * glibc's pthread thin wrappers.
  */
 static i64 sys_sched_setscheduler_h(struct trap_frame *tf,
                                     struct sched_task *td)
@@ -3116,8 +3672,8 @@ static i64 sys_sched_setscheduler_h(struct trap_frame *tf,
     if ((u8) prio > td->td_base_prio)
         return -(i64) EPERM;
 
-    /* Coerce all three policies to the single supported mapping; the
-     * policy argument is preserved purely for the matching getter.
+    /* Coerce all three policies to the single supported mapping; the policy
+     * argument is preserved purely for the matching getter.
      */
     u16 pid = (u16) raw_pid;
     if (pid == 0) {
@@ -3183,11 +3739,10 @@ static i64 sys_timer_settime_h(struct trap_frame *tf, struct sched_task *td)
     i32 handle = (i32) tf->a0;
     u64 value_ms = tf->a1;
     u64 interval_ms = tf->a2;
-    /* a3 carries the SIGEV_THREAD_ID target. 0 means process-directed
-     * (caller did not opt into SIGEV_THREAD_ID). The kernel rejects
-     * non-zero TIDs that do not match a live thread of the owning
-     * proc up front so misconfigured timers fail at settime, not at
-     * silent expiry.
+    /* a3 carries the SIGEV_THREAD_ID target. 0 means process-directed (caller
+     * did not opt into SIGEV_THREAD_ID). The kernel rejects non-zero TIDs that
+     * do not match a live thread of the owning proc up front so misconfigured
+     * timers fail at settime, not at silent expiry.
      */
     u16 target_tid = 0;
     if (tf->a3 != 0) {
@@ -3316,6 +3871,8 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_CLOCK_GETTIME] = {sys_clock_gettime, 0},
     [SYS_CLOCK_GETRES] = {sys_clock_getres, 0},
     [SYS_NANOSLEEP] = {sys_nanosleep, 0},
+    [SYS_CLOCK_NANOSLEEP] = {sys_clock_nanosleep, 0},
+    [SYS_CLOCK_SETTIME] = {sys_clock_settime, 0},
 
     /* PSE51 memory locking */
     [SYS_MLOCKALL] = {sys_mlockall, 0},
@@ -3334,6 +3891,7 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_MUTEX_INIT] = {sys_mutex_init_h, SYSCALL_F_NEEDS_PROC},
     [SYS_MUTEX_LOCK] = {sys_mutex_lock_h, SYSCALL_F_NEEDS_PROC},
     [SYS_MUTEX_TRYLOCK] = {sys_mutex_trylock_h, SYSCALL_F_NEEDS_PROC},
+    [SYS_MUTEX_TIMEDLOCK] = {sys_mutex_timedlock_h, SYSCALL_F_NEEDS_PROC},
     [SYS_MUTEX_UNLOCK] = {sys_mutex_unlock_h, SYSCALL_F_NEEDS_PROC},
     [SYS_COND_INIT] = {sys_cond_init_h, SYSCALL_F_NEEDS_PROC},
     [SYS_COND_WAIT] = {sys_cond_wait_h, SYSCALL_F_NEEDS_PROC},
@@ -3368,6 +3926,7 @@ static const struct syscall_entry syscall_table[SYS_NR] = {
     [SYS_MQ_SEND] = {sys_mq_send, SYSCALL_F_NEEDS_PROC},
     [SYS_MQ_RECEIVE] = {sys_mq_receive, SYSCALL_F_NEEDS_PROC},
     [SYS_MQ_TIMEDRECEIVE] = {sys_mq_timedreceive, SYSCALL_F_NEEDS_PROC},
+    [SYS_MQ_TIMEDSEND] = {sys_mq_timedsend, SYSCALL_F_NEEDS_PROC},
 
     /* PSE51 scheduling (item 17) */
     [SYS_SCHED_GET_PRIORITY_MIN] = {sys_sched_get_priority_min, 0},

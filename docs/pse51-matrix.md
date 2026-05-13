@@ -17,8 +17,8 @@ PSE51 interfaces fare on top of that base.
 
 Mazu's PSE51-oriented userspace ABI is feature-complete: every
 mandatory PSE51 syscall is wired and exercised by selftests, and
-the `pthread_attr_*` family ships as a header-only library at
-`include/mazu/pthread.h` on top of the kernel surface.
+the thread plus primitive attribute families ship as header-only
+libraries at `include/mazu/pthread.h` on top of the kernel surface.
 
 Deliberate deviations (not fix-it gaps):
 
@@ -35,8 +35,9 @@ mlock / munlock range form, fsync / fdatasync,
 sched_setscheduler / _getscheduler, SIGEV_THREAD_ID timer
 delivery, CLOCK_THREAD_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID,
 absolute-timespec timed waits, thread-exit trampoline (with
-magic verification), pthread_attr_* family (header-only
-library at `include/mazu/pthread.h` plus explicit-priority
+magic verification), pthread_{attr,mutexattr,condattr,
+rwlockattr,barrierattr}_* families (header-only library at
+`include/mazu/pthread.h` plus explicit-priority
 spawn via `SYS_THREAD_CREATE_EXPLICIT`.
 
 Public docs should describe the implementation as "bounded
@@ -88,8 +89,8 @@ subsystem regression detail in `tests/tests-syscall.c`,
 |---|---|---|---|
 | `clock_gettime` | `SYS_CLOCK_GETTIME` | implemented | `CLOCK_MONOTONIC`, `CLOCK_REALTIME`, `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID`. |
 | `clock_getres` | `SYS_CLOCK_GETRES` | implemented | Resolution derives from the timebase frequency; sub-millisecond on QEMU `virt`. |
-| `clock_settime` | (none) | not-applicable | Realtime clock is anchored to boot ticks; no settable wall clock yet. |
-| `clock_nanosleep` | (none) | stubbed | The relative form is covered by `nanosleep`; the absolute form is tracked under PSE51 ABI alignment work. |
+| `clock_settime` | `SYS_CLOCK_SETTIME` | implemented-with-mazu-abi | Writable for `CLOCK_REALTIME` only. The kernel stores a realtime offset against monotonic ticks; there is no external RTC/NTP source yet. |
+| `clock_nanosleep` | `SYS_CLOCK_NANOSLEEP` | implemented | Supports `CLOCK_MONOTONIC` and `CLOCK_REALTIME`. `TIMER_ABSTIME` deadlines in the past return success immediately and never write `*rem`; CPU-time clocks are rejected with `EINVAL`. |
 | `nanosleep` | `SYS_NANOSLEEP` | implemented-with-mazu-abi | Accepts `struct timespec`. On `EINTR` the kernel writes the unexpired remainder to `*rem` when `rem` is non-NULL (best-effort: a bad `rem` pointer does not mask the `EINTR` return). On normal completion `*rem` is unmodified. `tv_sec` is bounded against u64 overflow to keep the kernel-side ns/ms conversion safe. |
 
 ## Synchronization (kernel handles)
@@ -100,14 +101,14 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | Interface (POSIX) | Mazu syscall | Status | Notes |
 |---|---|---|---|
 | `pthread_mutex_init` / `_lock` / `_trylock` / `_unlock` | `SYS_MUTEX_INIT` / `_LOCK` / `_TRYLOCK` / `_UNLOCK` | implemented | Priority-inheritance, direct handover, no barging. No `pthread_mutex_destroy` syscall yet; handles are reaped on process exit. |
-| `pthread_mutex_timedlock` | (none) | stubbed | Not exposed; bounded callers use `sem_timedwait` or `cond_timedwait`. |
+| `pthread_mutex_timedlock` | `SYS_MUTEX_TIMEDLOCK` | implemented | Absolute `struct timespec *` on CLOCK_REALTIME; converted in-kernel. Preserves PI boost while queued and drops it on timeout. NULL abstime is rejected with EINVAL (no silent infinite wait). |
 | `pthread_cond_init` / `_signal` / `_broadcast` / `_wait` | `SYS_COND_INIT` / `_SIGNAL` / `_BROADCAST` / `_WAIT` | implemented | Timed wait below. No `pthread_cond_destroy` syscall yet. |
-| `pthread_cond_timedwait` | `SYS_COND_TIMEDWAIT` | implemented | ABI takes an absolute `struct timespec *` (CLOCK_MONOTONIC); the conversion to a relative timeout happens at syscall entry to avoid the libc-shim race. |
-| `sem_init` / `_wait` / `_trywait` / `_post` | `SYS_SEM_INIT` / `_WAIT` / `_TRYWAIT` / `_POST` | implemented | Counting semaphore with FIFO direct handover. |
-| `sem_timedwait` | `SYS_SEM_TIMEDWAIT` | implemented | Absolute `struct timespec *`; converted in-kernel. |
+| `pthread_cond_timedwait` | `SYS_COND_TIMEDWAIT` | implemented | ABI takes an absolute `struct timespec *` on CLOCK_REALTIME; the conversion to a relative timeout happens at syscall entry to avoid the libc-shim race. The waiter registers with the realtime-clock restart list, so a concurrent `SYS_CLOCK_SETTIME` re-evaluates the deadline rather than letting the wait drift. `pthread_condattr_setclock` still round-trips CLOCK_MONOTONIC for source compatibility, but the kernel ABI is single-clock today; a future condvar that needs monotonic absolute waits must carry the clock selection on the wire. |
+| `sem_init` / `_wait` / `_trywait` / `_post` | `SYS_SEM_INIT` / `_WAIT` / `_TRYWAIT` / `_POST` | implemented | Counting semaphore with FIFO direct handover. No owner concept, so no PI; use PI mutex for owner-sensitive RT critical sections. |
+| `sem_timedwait` | `SYS_SEM_TIMEDWAIT` | implemented | Absolute `struct timespec *` on CLOCK_REALTIME; converted in-kernel. Registers with the realtime-clock restart list so `SYS_CLOCK_SETTIME` re-evaluates the deadline. NULL abstime is rejected with EINVAL. |
 | `pthread_barrier_init` / `_wait` / `_destroy` | `SYS_BARRIER_INIT` / `_WAIT` / `_DESTROY` | implemented | `_destroy` returns `-EBUSY` when waiters are present. |
-| `pthread_rwlock_init` / `_rdlock` / `_wrlock` / `_tryrdlock` / `_trywrlock` / `_unlock` / `_destroy` | `SYS_RWLOCK_*` | implemented | Writer-preference; standard `EBUSY` semantics. |
-| `pthread_rwlock_timedrdlock` / `_timedwrlock` | `SYS_RWLOCK_TIMEDRDLOCK` / `_TIMEDWRLOCK` | implemented | Absolute `struct timespec *`; converted in-kernel. |
+| `pthread_rwlock_init` / `_rdlock` / `_wrlock` / `_tryrdlock` / `_trywrlock` / `_unlock` / `_destroy` | `SYS_RWLOCK_*` | implemented | Writer-preference; standard `EBUSY` semantics. No PI on the read side, so rwlocks are functional but unsuitable for hard-RT critical paths. |
+| `pthread_rwlock_timedrdlock` / `_timedwrlock` | `SYS_RWLOCK_TIMEDRDLOCK` / `_TIMEDWRLOCK` | implemented | Absolute `struct timespec *` on CLOCK_REALTIME; converted in-kernel. Registers with the realtime-clock restart list. NULL abstime is rejected with EINVAL. |
 
 ## Threads
 
@@ -120,7 +121,8 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | `pthread_exit` | `SYS_THREAD_EXIT` | implemented | Last-thread exit collapses into `proc_exit`; non-last exit unwinds the thread's robust futex list. A user thread that returns from its entry function lands on the per-process unmapped trampoline at `signal_trampoline_pc(p)+4`; the trap handler synthesizes `SYS_THREAD_EXIT(0)`, so an implicit return is equivalent to an explicit pthread_exit. |
 | `pthread_setschedparam` / `_getschedparam` | `SYS_THREAD_SETSCHEDPARAM` / `_GETSCHEDPARAM` | implemented-with-mazu-abi | Take a `CAP_TYPE_THREAD` handle (0 = self) and a scalar priority. Privilege bound: cannot raise above caller's own base priority. |
 | `pthread_attr_*` | (libc) | implemented | Header-only library at `include/mazu/pthread.h`. Covers `pthread_attr_init` / `_destroy` / `_setdetachstate` / `_getdetachstate` / `_setinheritsched` / `_getinheritsched` / `_setschedpolicy` / `_getschedpolicy` / `_setschedparam` / `_getschedparam` / `_setstacksize` / `_getstacksize` / `_setstack` / `_getstack`. All functions return positive errno on failure (POSIX convention). Stack address selection is delegated to the kernel (shared-VA model); `pthread_attr_setstack` always returns `ENOTSUP`, and `pthread_attr_setstacksize` succeeds only for `USER_STACK_SIZE`, so callers do not observe a stack contract the kernel cannot honor. The accompanying `pthread_attr_resolve_create_syscall` and `pthread_attr_resolve_prio_arg` helpers produce the syscall number and a2 encoding for the future `pthread_create` wrapper. |
-| `pthread_spin_init` / `_lock` / `_trylock` / `_unlock` / `_destroy` | (none) | stubbed | Mazu has kernel-internal spinlocks, but no userspace-visible busy-wait primitive. The `_POSIX_SPIN_LOCKS` macro is therefore intentionally *not* defined and `_SC_SPIN_LOCKS` returns -1 — advertising it would let an app gate on the macro and call absent APIs. Expect a libc-side implementation backed by a futex once threads land, not a kernel syscall. |
+| `pthread_mutexattr_*` / `pthread_condattr_*` / `pthread_rwlockattr_*` / `pthread_barrierattr_*` | (libc) | implemented | Header-only library at `include/mazu/pthread.h`. Attribute objects are data-only and return positive errno on failure. `pthread_mutexattr_setprotocol` accepts `PTHREAD_PRIO_INHERIT`; `PTHREAD_PRIO_NONE` / `PTHREAD_PRIO_PROTECT` return `ENOTSUP`. `pthread_condattr_setclock` round-trips `CLOCK_MONOTONIC` and `CLOCK_REALTIME`. |
+| `pthread_spin_init` / `_lock` / `_trylock` / `_unlock` / `_destroy` | (none) | stubbed | Mazu has kernel-internal spinlocks, but no userspace-visible busy-wait primitive. The `_POSIX_SPIN_LOCKS` macro is therefore intentionally *not* defined and `_SC_SPIN_LOCKS` returns -1 so applications detect the absence of the userspace surface cleanly. If a future libc wrapper is added, it should be an explicit futex-backed design choice rather than an implied property of the current ABI. |
 | `pthread_cancel` / `pthread_setcancelstate` / `pthread_testcancel` | `SYS_THREAD_CANCEL` / `SYS_THREAD_SETCANCELSTATE` / `SYS_THREAD_TESTCANCEL` | implemented | Deferred cancellation: pthread_cancel sets `td_cancel_pending`; the target observes the bit at the next cancellation point and exits with code -ECANCELED. ASYNC type is treated as DEFERRED because Mazu has no in-kernel cancellation points other than blocking syscalls. |
 
 ## Signals
@@ -154,10 +156,10 @@ sync handle table (`kernel/sync/sync_handle.c`).
 |---|---|---|---|
 | `mq_open` | `SYS_MQ_OPEN` | implemented-with-mazu-abi | Anonymous queues only: ABI takes `(max_msgs, max_msg_size)` and returns a handle. There is no name and no `mq_unlink`. Inherited across `SYS_SPAWN`. |
 | `mq_close` | `SYS_MQ_CLOSE` | implemented | |
-| `mq_send` | `SYS_MQ_SEND` | implemented | Non-blocking on full queue. |
-| `mq_receive` | `SYS_MQ_RECEIVE` | implemented | |
-| `mq_timedreceive` | `SYS_MQ_TIMEDRECEIVE` | implemented | Absolute `struct timespec *`; converted in-kernel. |
-| `mq_timedsend` | (none) | stubbed | Not exposed; non-blocking `mq_send` is the only send form. |
+| `mq_send` | `SYS_MQ_SEND` | implemented | Blocks on full queue until space becomes available, the queue is torn down, or the wait is interrupted. Zero-length messages are accepted (POSIX-correct); priorities are bounded to `[0, MQ_PRIO_MAX)` (`MQ_PRIO_MAX = 32`); out-of-range priorities return EINVAL; bad mqd_t returns EBADF. |
+| `mq_receive` | `SYS_MQ_RECEIVE` | implemented | Strict POSIX `buf_size >= mq_msgsize` check at syscall entry; too-small buffer returns EMSGSIZE before any message is dequeued; bad mqd_t returns EBADF. |
+| `mq_timedreceive` | `SYS_MQ_TIMEDRECEIVE` | implemented | Absolute `struct timespec *` on CLOCK_REALTIME; converted in-kernel. Registers with the realtime-clock restart list. NULL abstime is rejected with EINVAL. Same EBADF / EMSGSIZE contract as `mq_receive`. |
+| `mq_timedsend` | `SYS_MQ_TIMEDSEND` | implemented | Absolute `struct timespec *` on CLOCK_REALTIME; converted in-kernel. Registers with the realtime-clock restart list. NULL abstime is rejected with EINVAL. Same priority / EBADF contract as `mq_send`. |
 | `mq_notify` | (none) | not-applicable | Out of scope for the bounded RT model. |
 | `mq_unlink` | (none) | not-applicable | Anonymous queues (no namespace). |
 
@@ -193,7 +195,7 @@ Mazu has a real filesystem, so the gap shows up here.
 |---|---|---|---|
 | `fsync` | `SYS_FSYNC` | implemented-with-mazu-abi | Validates the FD is open, returns success. The disk-backed SFS already commits writes synchronously inside `kernel/fs/sfs.c`; the synthetic and RAM filesystems have no backing store. |
 | `fdatasync` | `SYS_FDATASYNC` | implemented-with-mazu-abi | Same backing logic as `fsync` for Mazu (no separate metadata vs data path). |
-| `O_SYNC` / `O_DSYNC` open flags | (none) | stubbed | Open flags are not parsed today. |
+| `O_SYNC` / `O_DSYNC` open flags | `SYS_OPEN` (a2 flags) | implemented-with-mazu-abi | `SYS_OPEN` now accepts a reduced flags word and stores the accepted sync bits on the FD record. Current supported subset is `O_SYNC | O_DSYNC`; other flag bits are rejected with `EINVAL`. |
 
 ## Filesystem and process model
 
@@ -242,7 +244,9 @@ feature-test value when implemented, or `-1` when absent):
 | `_SC_THREADS` | `_POSIX_THREADS` (1) | `SYS_THREAD_*` present; `PROC_THREAD_MAX = 4`. |
 | `_SC_THREAD_CPUTIME` | `_POSIX_THREAD_CPUTIME` (200809L) | `clock_gettime(CLOCK_THREAD_CPUTIME_ID, ...)` measures the calling thread's accumulated CPU time. |
 | `_SC_CPUTIME` | `_POSIX_CPUTIME` (200809L) | `clock_gettime(CLOCK_PROCESS_CPUTIME_ID, ...)` returns the sum across all live threads in the calling process. |
-| `_SC_CLOCK_SELECTION` | -1 | No `clock_nanosleep`. |
+| `_SC_CLOCK_SELECTION` | `_POSIX_CLOCK_SELECTION` (200809L) | `clock_nanosleep` is present for `CLOCK_MONOTONIC` / `CLOCK_REALTIME`. |
+| `_SC_TIMEOUTS` | `_POSIX_TIMEOUTS` (200809L) | Timed mutex, semaphore, rwlock, and mqueue waits are present. |
+| `_SC_SYNCHRONIZED_IO` | `_POSIX_SYNCHRONIZED_IO` (200809L) | `fsync` / `fdatasync` and `O_SYNC` / `O_DSYNC` flag acceptance are present. |
 
 ## Deliberate deviations from PSE51
 
@@ -270,4 +274,13 @@ futex list, errno TLS), the user-visible pthread surface
 `pthread_create` wrapper can honor `PTHREAD_EXPLICIT_SCHED` without
 the `SETSCHEDPARAM`-after-create race window by switching from
 `SYS_THREAD_CREATE` to `SYS_THREAD_CREATE_EXPLICIT` and passing the
-resolved priority in a2 as (prio + 1).
+resolved priority in a2 as (prio + 1). Future `pthread_mutex_*` and
+`pthread_cond_*` wrappers should likewise converge on the futex PI ABI
+(`FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`, `FUTEX_CMP_REQUEUE_PI`) rather
+than introducing a third synchronization path on top of the existing
+kernel-handle and futex mechanisms. `FUTEX_LOCK_PI` already returns
+`-EOWNERDEAD` when the prior owner died holding the lock and
+preserves `FUTEX_OWNER_DIED` in the futex word, so a future
+robust-mutex wrapper can call `pthread_mutex_consistent` from that
+errno without a separate kernel ABI; `FUTEX_CMP_REQUEUE_PI` rejects
+`uaddr1 == uaddr2` with EINVAL.

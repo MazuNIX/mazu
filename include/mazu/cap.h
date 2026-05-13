@@ -1,30 +1,29 @@
 /* SPDX-License-Identifier: MIT */
 /* Capability-based security: public interface.
  *
- * Every process owns a fixed cap_space (CAP_SPACE_SLOTS entries). Each
- * slot is an unforgeable handle to a typed kernel object. The slot word
- * packs object_index, type, rights, type_meta, and a 32-bit generation;
- * the cap layer enforces unforgeability, single-hop delegation, lazy
- * revocation via generation bump, and an active-use pin that keeps the
- * underlying object alive across blocking syscalls.
+ * Every process owns a fixed cap_space (CAP_SPACE_SLOTS entries). Each slot is
+ * an unforgeable handle to a typed kernel object. Slot word packs object_index,
+ * type, rights, type_meta, and a 32-bit generation; the cap layer enforces
+ * unforgeability, single-hop delegation, lazy revocation via generation bump,
+ * and an active-use pin that keeps the underlying object alive across blocking
+ * syscalls.
  *
  * Userspace sees two handle shapes:
- *   - posix_fd: the small-int slot_index. This is what sys_open returns
- *     and what sys_read/sys_write/sys_close consume. The cap layer does
- *     the slot-bound permission check on every dereference.
- *   - cap_handle: a 64-bit token (cap_make_handle / cap_get_token) that
- *     carries the generation/type/rights snapshot taken at mint time.
- *     Required for cap-management syscalls that need stale-handle
- *     detection across threads or across spaces.
+ * - posix_fd: the small-int slot_index. This is what sys_open returns and what
+ *   sys_read/sys_write/sys_close consume. The cap layer does the slot-bound
+ *   permission check on every dereference.
+ * - cap_handle: a 64-bit token (cap_make_handle / cap_get_token) that carries
+ *   the generation/type/rights snapshot taken at mint time. Required for
+ *   cap-management syscalls that need stale-handle detection across threads or
+ *   across spaces.
  *
  * Rights are a 4-bit lattice (READ, WRITE, EXEC, GRANT). Rights are
- * monotonically non-increasing on delegation: cap_transfer strips GRANT,
- * while spawn-style cap_inherit_fd preserves the source rights snapshot.
+ * monotonically non-increasing on delegation: cap_transfer strips GRANT, while
+ * spawn-style cap_inherit_fd preserves the source rights snapshot.
  * Plain sys_open does not mint GRANT.
  *
- * Implementation lives in kernel/proc/cap.c; the threat model, slot bit
- * layout, lock ordering, and refcount lifecycle are documented in that
- * file's header.
+ * Implementation lives in kernel/proc/cap.c; the threat model, slot bit layout,
+ * lock ordering, and refcount lifecycle are documented in that file's header.
  */
 
 #ifndef MAZU_CAP_H
@@ -43,16 +42,16 @@ struct proc;
  */
 #define CAP_SPACE_SLOTS 128
 
-/* System-wide pool of delegate_record entries. Each cap_transfer
- * allocates one; cap_revoke_delegate consumes it. Sized to cover the
- * worst-case outstanding-delegation count across all processes.
+/* System-wide pool of delegate_record entries. Each cap_transfer allocates one;
+ * cap_revoke_delegate consumes it. Sized to cover the worst-case
+ * outstanding-delegation count across all processes.
  */
 #define CAP_DELEGATE_RECORD_MAX 1024
 
-/* Typed handle kinds. The slot word stores 4 bits, so up to 16 types
- * fit; the unused 2 are reserved for future kernel-object surfaces.
- * Adding a transferable type also requires extending cap_release_object
- * and cap_object_inc_ref dispatches in kernel/proc/cap.c.
+/* Typed handle kinds. The slot word stores 4 bits, so up to 16 types fit; the
+ * unused 2 are reserved for future kernel-object surfaces.
+ * Adding a transferable type also requires extending cap_release_object and
+ * cap_object_inc_ref dispatches in kernel/proc/cap.c.
  */
 enum cap_type {
     CAP_TYPE_NONE = 0,     /* empty / dropped slot */
@@ -108,20 +107,19 @@ struct cap_space {
      * cap_lookup_* / cap_open_* / cap_drop_* helpers.
      */
     u64 slots[CAP_SPACE_SLOTS];
-    /* Per-slot grant_epoch snapshot. For slots minted by cap_transfer
-     * (or by spawn-time inheritance from such a slot), this records the
-     * originating delegate_record's 64-bit monotonic epoch.
-     * cap_revoke_delegate's scan matches on (type, object_index,
-     * delegate_epoch) so that 32-bit slot generation wrapping or two
-     * unrelated grants of the same object cannot be confused. Zero for
-     * slots that are not part of any outstanding delegation.
+
+    /* Per-slot grant_epoch snapshot. For slots minted by cap_transfer (or by
+     * spawn-time inheritance from such a slot), this records the originating
+     * delegate_record's 64-bit monotonic epoch. cap_revoke_delegate's scan
+     * matches on (type, object_index, delegate_epoch) so that 32-bit slot
+     * generation wrapping or two unrelated grants of the same object cannot be
+     * confused. Zero for slots that are not part of any outstanding delegation.
      */
     u64 delegate_epoch[CAP_SPACE_SLOTS];
 };
 
-/* Object-constructor return shape. Used by cap-system internal mint
- * paths that take a fully-resolved object pointer and assign it to a
- * slot under fd_lock.
+/* Object-constructor return shape. Used by cap-system internal mint paths that
+ * take a fully-resolved object pointer and assign it to a slot under fd_lock.
  */
 struct cap_ctor_result {
     u16 object_index;
@@ -129,16 +127,15 @@ struct cap_ctor_result {
     u16 type_meta;
 };
 
-/* Active-use pin on a kernel object. Returned by cap_lookup_fd /
- * cap_lookup_timer / cap_lookup_object after the cap is validated and
- * the underlying pool entry's refcount has been bumped. The caller MUST
- * pair every non-zeroed return with cap_put_ref so the pool entry
- * survives concurrent revocation across blocking syscalls.
+/* Active-use pin on a kernel object. Returned by cap_lookup_{fd,timer,object}
+ * after the cap is validated and the underlying pool entry's refcount has been
+ * bumped. The caller MUST pair every non-zeroed return with cap_put_ref so the
+ * pool entry survives concurrent revocation across blocking syscalls.
  *
- * The empty / dropped state is type == CAP_TYPE_NONE; cap_put_ref
- * tests the type field (not ptr) for liveness, since lookup variants
- * for sync primitives and mqueue return ptr == NULL and fetch the
- * typed pointer via a separate _get helper.
+ * The empty / dropped state is type == CAP_TYPE_NONE; cap_put_ref tests the
+ * type field (not ptr) for liveness, since lookup variants for sync primitives
+ * and mqueue return ptr == NULL and fetch the typed pointer via a separate _get
+ * helper.
  */
 struct cap_ref {
     void *ptr;
@@ -146,9 +143,9 @@ struct cap_ref {
     u8 type;
 };
 
-/* Read-only snapshot of a cap_space slot, returned by cap_slot_read /
- * cap_lookup_slot / cap_lookup_token. The slot_index is the array
- * position; the other fields mirror the slot word.
+/* Read-only snapshot of cap_space slot, returned by cap_{slot_read,lookup_slot,
+ * lookup_token}. The slot_index is the array position; the other fields mirror
+ * the slot word.
  */
 struct cap_slot_view {
     bool valid;
@@ -160,9 +157,9 @@ struct cap_slot_view {
     u32 generation;
 };
 
-/* Per-FD pool entry. One per open file description; multiple cap_space
- * slots may reference the same entry (dup, transfer, inheritance) and
- * refcount tracks how many.
+/* Per-FD pool entry. One per open file description; multiple cap_space slots
+ * may reference the same entry (dup, transfer, inheritance) and refcount tracks
+ * how many.
  */
 struct fd_pool_entry {
     bool in_use;
@@ -170,6 +167,7 @@ struct fd_pool_entry {
     bool pipe_read_end;
     bool is_seekable;
     u8 console_id;
+    u32 open_flags;
     sz offset;    /* POSIX dup'd FDs share this offset */
     u32 refcount; /* cap_space slots + active-use pins */
     struct vfs_file file;
@@ -195,6 +193,7 @@ i32 cap_open_vfs(struct proc *p,
                  struct vfs_file file,
                  u8 rights,
                  bool is_seekable,
+                 u32 open_flags,
                  i32 slot_hint,
                  bool exact_target);
 i32 cap_open_pipe(struct proc *p,
@@ -224,6 +223,7 @@ bool cap_fd_has_rights(struct proc *p, i32 fd, u8 rights);
 bool cap_fd_is_seekable(struct proc *p, i32 fd);
 bool cap_fd_is_pipe(struct proc *p, i32 fd);
 bool cap_fd_pipe_read_end(struct proc *p, i32 fd);
+u32 cap_fd_open_flags(struct proc *p, i32 fd);
 struct cap_slot_view cap_slot_read(struct proc *p, i32 slot_idx);
 i32 cap_find_free_fd(struct proc *p);
 bool cap_lookup_slot(struct proc *p,

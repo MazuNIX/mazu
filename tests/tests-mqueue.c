@@ -115,6 +115,60 @@ static i32 test_mq_timedreceive(void)
 }
 DEFINE_SELFTEST(mq_timedreceive, test_mq_timedreceive);
 
+static volatile bool mq_timedsend_recv_done;
+static volatile u8 mq_timedsend_recv_value;
+static volatile u32 mq_timedsend_recv_prio;
+static volatile i32 mq_timedsend_handle;
+
+static void mq_timedsend_receiver(void *ctx __unused)
+{
+    SELFTEST_KICK_AND_YIELD(20);
+    u8 buf = 0;
+    u32 prio = 0;
+    i32 ret = mqueue_receive((i32) mq_timedsend_handle, &buf, 1, &prio);
+    if (ret == 1) {
+        __atomic_store_n(&mq_timedsend_recv_value, buf, __ATOMIC_RELEASE);
+        __atomic_store_n(&mq_timedsend_recv_prio, prio, __ATOMIC_RELEASE);
+        __atomic_store_n(&mq_timedsend_recv_done, true, __ATOMIC_RELEASE);
+    }
+}
+
+static i32 test_mq_timedsend(void)
+{
+    i32 h = mqueue_open(NULL, 1, 8);
+    SELFTEST_ASSERT(h >= 0, 1);
+
+    u8 first = 1;
+    SELFTEST_ASSERT(mqueue_send(h, &first, 1, 3) == 0, 2);
+
+    u8 second = 2;
+    SELFTEST_ASSERT(
+        mqueue_timedsend(h, &second, 1, 4, time_ms_new(1)) == -(i32) ETIMEDOUT,
+        3);
+
+    __atomic_store_n(&mq_timedsend_handle, h, __ATOMIC_RELEASE);
+    __atomic_store_n(&mq_timedsend_recv_done, false, __ATOMIC_RELEASE);
+    struct result r = sched_create_task(mq_timedsend_receiver, NULL);
+    SELFTEST_ASSERT(!r.is_error, 4);
+
+    SELFTEST_ASSERT(mqueue_timedsend(h, &second, 1, 4, time_ms_new(100)) == 0,
+                    5);
+    SELFTEST_ASSERT(!selftest_poll_flag(&mq_timedsend_recv_done, 20, 10), 6);
+    SELFTEST_ASSERT(
+        __atomic_load_n(&mq_timedsend_recv_value, __ATOMIC_ACQUIRE) == 1, 7);
+    SELFTEST_ASSERT(
+        __atomic_load_n(&mq_timedsend_recv_prio, __ATOMIC_ACQUIRE) == 3, 8);
+
+    u8 buf = 0;
+    u32 prio = 0;
+    SELFTEST_ASSERT(mqueue_receive(h, &buf, 1, &prio) == 1, 9);
+    SELFTEST_ASSERT(buf == 2 && prio == 4, 10);
+
+    mqueue_close(h);
+    return 0;
+}
+DEFINE_SELFTEST(mq_timedsend, test_mq_timedsend);
+
 static i32 test_mq_close_invalid(void)
 {
     SELFTEST_ASSERT(mqueue_close(-1) == -(i32) EBADF, 1);

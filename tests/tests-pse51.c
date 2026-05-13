@@ -54,7 +54,11 @@ static i32 test_pse51_sysconf_profile(void)
     SELFTEST_ASSERT(
         sys_sysconf_query(_SC_REALTIME_SIGNALS) == _POSIX_REALTIME_SIGNALS, 12);
     SELFTEST_ASSERT(sys_sysconf_query(_SC_SPIN_LOCKS) == -1, 13);
-    SELFTEST_ASSERT(sys_sysconf_query(_SC_CLOCK_SELECTION) == -1, 14);
+    SELFTEST_ASSERT(
+        sys_sysconf_query(_SC_CLOCK_SELECTION) == _POSIX_CLOCK_SELECTION, 14);
+    SELFTEST_ASSERT(sys_sysconf_query(_SC_TIMEOUTS) == _POSIX_TIMEOUTS, 15);
+    SELFTEST_ASSERT(
+        sys_sysconf_query(_SC_SYNCHRONIZED_IO) == _POSIX_SYNCHRONIZED_IO, 16);
     return 0;
 }
 DEFINE_SELFTEST(pse51_sysconf_profile, test_pse51_sysconf_profile);
@@ -81,6 +85,7 @@ static i32 test_pse51_time_profile(void)
     SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 6);
     SELFTEST_ASSERT(copy_from_user(&ts, va, sizeof(ts)) == 0, 7);
     SELFTEST_ASSERT(ts.tv_nsec >= 0 && ts.tv_nsec < NSEC_PER_SEC, 8);
+    struct timespec orig_rt = ts;
 
     td->cpu_time_us = 1234567ULL;
     tf.a0 = CLOCK_THREAD_CPUTIME_ID;
@@ -117,6 +122,52 @@ static i32 test_pse51_time_profile(void)
     ts.tv_nsec = (i64) NSEC_PER_SEC;
     SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 22);
     SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EINVAL, 23);
+
+    tf.a7 = SYS_CLOCK_GETTIME;
+    tf.a0 = CLOCK_MONOTONIC;
+    tf.a1 = (u64) va;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 24);
+    SELFTEST_ASSERT(copy_from_user(&ts, va, sizeof(ts)) == 0, 25);
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 26);
+    struct timespec rem = {.tv_sec = 7, .tv_nsec = 11};
+    SELFTEST_ASSERT(copy_to_user(va + 32, &rem, sizeof(rem)) == 0, 27);
+    tf.a7 = SYS_CLOCK_NANOSLEEP;
+    tf.a0 = CLOCK_MONOTONIC;
+    tf.a1 = TIMER_ABSTIME;
+    tf.a2 = (u64) va;
+    tf.a3 = (u64) (va + 32);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 28);
+    SELFTEST_ASSERT(copy_from_user(&rem, va + 32, sizeof(rem)) == 0, 29);
+    SELFTEST_ASSERT(rem.tv_sec == 7 && rem.tv_nsec == 11, 30);
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 1;
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 31);
+    tf.a0 = CLOCK_PROCESS_CPUTIME_ID;
+    tf.a1 = 0;
+    tf.a2 = (u64) va;
+    tf.a3 = 0;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EINVAL, 32);
+
+    ts.tv_sec = orig_rt.tv_sec + 2;
+    ts.tv_nsec = orig_rt.tv_nsec;
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 33);
+    tf.a7 = SYS_CLOCK_SETTIME;
+    tf.a0 = CLOCK_REALTIME;
+    tf.a1 = (u64) va;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 34);
+
+    tf.a7 = SYS_CLOCK_GETTIME;
+    tf.a0 = CLOCK_REALTIME;
+    tf.a1 = (u64) va;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 35);
+    SELFTEST_ASSERT(copy_from_user(&ts, va, sizeof(ts)) == 0, 36);
+    SELFTEST_ASSERT(ts.tv_sec >= orig_rt.tv_sec + 2, 37);
+
+    tf.a7 = SYS_CLOCK_SETTIME;
+    tf.a0 = CLOCK_MONOTONIC;
+    tf.a1 = (u64) va;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EINVAL, 38);
 
     free_proc_and_task(p, td);
     return 0;
@@ -219,81 +270,102 @@ static i32 test_pse51_sync_profile(void)
     tf.a7 = SYS_MUTEX_UNLOCK;
     SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 7);
 
+    tf.a7 = SYS_MUTEX_LOCK;
+    tf.a0 = (u64) mutex_h;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 8);
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 9);
+    tf.a7 = SYS_MUTEX_TIMEDLOCK;
+    tf.a1 = (u64) va;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 10);
+    tf.a7 = SYS_MUTEX_UNLOCK;
+    tf.a1 = 0;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 11);
+
     tf.a7 = SYS_COND_INIT;
     cond_h = syscall_dispatch(&tf, td);
-    SELFTEST_ASSERT(cond_h >= 0, 8);
+    SELFTEST_ASSERT(cond_h >= 0, 12);
 
     tf.a7 = SYS_COND_SIGNAL;
     tf.a0 = (u64) cond_h;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 9);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 13);
 
     tf.a7 = SYS_COND_BROADCAST;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 10);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 14);
 
     tf.a7 = SYS_SEM_INIT;
     tf.a0 = 1;
     sem_h = syscall_dispatch(&tf, td);
-    SELFTEST_ASSERT(sem_h >= 0, 11);
+    SELFTEST_ASSERT(sem_h >= 0, 15);
 
     tf.a7 = SYS_SEM_WAIT;
     tf.a0 = (u64) sem_h;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 12);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 16);
 
     tf.a7 = SYS_SEM_POST;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 13);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 17);
 
     tf.a7 = SYS_SEM_TRYWAIT;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 14);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 18);
 
     ts.tv_sec = 0;
     ts.tv_nsec = 0;
-    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 15);
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 19);
     tf.a7 = SYS_SEM_TIMEDWAIT;
     tf.a0 = (u64) sem_h;
     tf.a1 = (u64) va;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 16);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 20);
 
     tf.a7 = SYS_BARRIER_INIT;
     tf.a0 = 1;
     barrier_h = syscall_dispatch(&tf, td);
-    SELFTEST_ASSERT(barrier_h >= 0, 17);
+    SELFTEST_ASSERT(barrier_h >= 0, 21);
 
     tf.a7 = SYS_BARRIER_WAIT;
     tf.a0 = (u64) barrier_h;
     SELFTEST_ASSERT(
-        syscall_dispatch(&tf, td) == (i64) PTHREAD_BARRIER_SERIAL_THREAD, 18);
+        syscall_dispatch(&tf, td) == (i64) PTHREAD_BARRIER_SERIAL_THREAD, 22);
 
     tf.a7 = SYS_BARRIER_DESTROY;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 19);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 23);
 
     tf.a7 = SYS_RWLOCK_INIT;
     rwlock_h = syscall_dispatch(&tf, td);
-    SELFTEST_ASSERT(rwlock_h >= 0, 20);
+    SELFTEST_ASSERT(rwlock_h >= 0, 24);
 
     tf.a7 = SYS_RWLOCK_RDLOCK;
     tf.a0 = (u64) rwlock_h;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 21);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 25);
 
     tf.a7 = SYS_RWLOCK_UNLOCK;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 22);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 26);
 
     tf.a7 = SYS_RWLOCK_TRYWRLOCK;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 23);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 27);
 
     tf.a7 = SYS_RWLOCK_UNLOCK;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 24);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 28);
+
+    tf.a7 = SYS_RWLOCK_WRLOCK;
+    tf.a0 = (u64) rwlock_h;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 29);
 
     ts.tv_sec = 0;
     ts.tv_nsec = 0;
-    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 25);
+    SELFTEST_ASSERT(copy_to_user(va, &ts, sizeof(ts)) == 0, 30);
     tf.a7 = SYS_RWLOCK_TIMEDRDLOCK;
     tf.a0 = (u64) rwlock_h;
     tf.a1 = (u64) va;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 26);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 31);
+
+    tf.a7 = SYS_RWLOCK_UNLOCK;
+    tf.a0 = (u64) rwlock_h;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 32);
 
     tf.a7 = SYS_RWLOCK_DESTROY;
     tf.a0 = (u64) rwlock_h;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 27);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 33);
 
     free_proc_and_task(p, td);
     return 0;
@@ -538,6 +610,101 @@ static i32 test_pse51_pthread_attr_profile(void)
 }
 DEFINE_SELFTEST(pse51_pthread_attr_profile, test_pse51_pthread_attr_profile);
 
+static i32 test_pse51_pthread_primitive_attr_profile(void)
+{
+    pthread_mutexattr_t mtx;
+    pthread_condattr_t cond;
+    pthread_rwlockattr_t rw;
+    pthread_barrierattr_t bar;
+    i32 v = 0;
+
+    SELFTEST_ASSERT(pthread_mutexattr_init(NULL) == EINVAL, 1);
+    SELFTEST_ASSERT(pthread_mutexattr_destroy(NULL) == EINVAL, 2);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_settype(NULL, PTHREAD_MUTEX_NORMAL) == EINVAL, 3);
+    SELFTEST_ASSERT(pthread_mutexattr_gettype(NULL, &v) == EINVAL, 4);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setprotocol(NULL, PTHREAD_PRIO_INHERIT) == EINVAL, 5);
+    SELFTEST_ASSERT(pthread_mutexattr_getprotocol(NULL, &v) == EINVAL, 6);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setpshared(NULL, PTHREAD_PROCESS_PRIVATE) == EINVAL,
+        7);
+    SELFTEST_ASSERT(pthread_mutexattr_getpshared(NULL, &v) == EINVAL, 8);
+
+    SELFTEST_ASSERT(pthread_mutexattr_init(&mtx) == 0, 9);
+    SELFTEST_ASSERT(pthread_mutexattr_gettype(&mtx, &v) == 0, 10);
+    SELFTEST_ASSERT(v == PTHREAD_MUTEX_NORMAL, 11);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_settype(&mtx, PTHREAD_MUTEX_RECURSIVE) == 0, 12);
+    SELFTEST_ASSERT(pthread_mutexattr_gettype(&mtx, &v) == 0, 13);
+    SELFTEST_ASSERT(v == PTHREAD_MUTEX_RECURSIVE, 14);
+    SELFTEST_ASSERT(pthread_mutexattr_settype(&mtx, 99) == EINVAL, 15);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setprotocol(&mtx, PTHREAD_PRIO_INHERIT) == 0, 16);
+    SELFTEST_ASSERT(pthread_mutexattr_getprotocol(&mtx, &v) == 0, 17);
+    SELFTEST_ASSERT(v == PTHREAD_PRIO_INHERIT, 18);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setprotocol(&mtx, PTHREAD_PRIO_PROTECT) == ENOTSUP,
+        19);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setprotocol(&mtx, PTHREAD_PRIO_NONE) == ENOTSUP, 20);
+    SELFTEST_ASSERT(
+        pthread_mutexattr_setpshared(&mtx, PTHREAD_PROCESS_SHARED) == 0, 21);
+    SELFTEST_ASSERT(pthread_mutexattr_getpshared(&mtx, &v) == 0, 22);
+    SELFTEST_ASSERT(v == PTHREAD_PROCESS_SHARED, 23);
+    SELFTEST_ASSERT(pthread_mutexattr_destroy(&mtx) == 0, 24);
+
+    SELFTEST_ASSERT(pthread_condattr_init(NULL) == EINVAL, 25);
+    SELFTEST_ASSERT(pthread_condattr_destroy(NULL) == EINVAL, 26);
+    SELFTEST_ASSERT(
+        pthread_condattr_setpshared(NULL, PTHREAD_PROCESS_PRIVATE) == EINVAL,
+        27);
+    SELFTEST_ASSERT(pthread_condattr_getpshared(NULL, &v) == EINVAL, 28);
+    SELFTEST_ASSERT(pthread_condattr_setclock(NULL, CLOCK_REALTIME) == EINVAL,
+                    29);
+    SELFTEST_ASSERT(pthread_condattr_getclock(NULL, &v) == EINVAL, 30);
+    SELFTEST_ASSERT(pthread_condattr_init(&cond) == 0, 31);
+    SELFTEST_ASSERT(pthread_condattr_getclock(&cond, &v) == 0, 32);
+    SELFTEST_ASSERT(v == CLOCK_REALTIME, 33);
+    SELFTEST_ASSERT(pthread_condattr_setclock(&cond, CLOCK_MONOTONIC) == 0, 34);
+    SELFTEST_ASSERT(pthread_condattr_getclock(&cond, &v) == 0, 35);
+    SELFTEST_ASSERT(v == CLOCK_MONOTONIC, 36);
+    SELFTEST_ASSERT(
+        pthread_condattr_setpshared(&cond, PTHREAD_PROCESS_SHARED) == 0, 37);
+    SELFTEST_ASSERT(pthread_condattr_getpshared(&cond, &v) == 0, 38);
+    SELFTEST_ASSERT(v == PTHREAD_PROCESS_SHARED, 39);
+    SELFTEST_ASSERT(pthread_condattr_destroy(&cond) == 0, 40);
+
+    SELFTEST_ASSERT(pthread_rwlockattr_init(NULL) == EINVAL, 41);
+    SELFTEST_ASSERT(pthread_rwlockattr_destroy(NULL) == EINVAL, 42);
+    SELFTEST_ASSERT(
+        pthread_rwlockattr_setpshared(NULL, PTHREAD_PROCESS_PRIVATE) == EINVAL,
+        43);
+    SELFTEST_ASSERT(pthread_rwlockattr_getpshared(NULL, &v) == EINVAL, 44);
+    SELFTEST_ASSERT(pthread_rwlockattr_init(&rw) == 0, 45);
+    SELFTEST_ASSERT(
+        pthread_rwlockattr_setpshared(&rw, PTHREAD_PROCESS_SHARED) == 0, 46);
+    SELFTEST_ASSERT(pthread_rwlockattr_getpshared(&rw, &v) == 0, 47);
+    SELFTEST_ASSERT(v == PTHREAD_PROCESS_SHARED, 48);
+    SELFTEST_ASSERT(pthread_rwlockattr_destroy(&rw) == 0, 49);
+
+    SELFTEST_ASSERT(pthread_barrierattr_init(NULL) == EINVAL, 50);
+    SELFTEST_ASSERT(pthread_barrierattr_destroy(NULL) == EINVAL, 51);
+    SELFTEST_ASSERT(
+        pthread_barrierattr_setpshared(NULL, PTHREAD_PROCESS_PRIVATE) == EINVAL,
+        52);
+    SELFTEST_ASSERT(pthread_barrierattr_getpshared(NULL, &v) == EINVAL, 53);
+    SELFTEST_ASSERT(pthread_barrierattr_init(&bar) == 0, 54);
+    SELFTEST_ASSERT(
+        pthread_barrierattr_setpshared(&bar, PTHREAD_PROCESS_SHARED) == 0, 55);
+    SELFTEST_ASSERT(pthread_barrierattr_getpshared(&bar, &v) == 0, 56);
+    SELFTEST_ASSERT(v == PTHREAD_PROCESS_SHARED, 57);
+    SELFTEST_ASSERT(pthread_barrierattr_destroy(&bar) == 0, 58);
+    return 0;
+}
+DEFINE_SELFTEST(pse51_pthread_primitive_attr_profile,
+                test_pse51_pthread_primitive_attr_profile);
+
 /* SYS_THREAD_CREATE stays a strict two-argument ABI: it ignores a2 so
  * pre-existing callers that do not clear unused registers keep working.
  * SYS_THREAD_CREATE_EXPLICIT carries the opt-in explicit-priority
@@ -741,7 +908,7 @@ static i32 test_pse51_timer_mqueue_profile(void)
     SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) EINVAL, 8);
 
     tf.a7 = SYS_MQ_OPEN;
-    tf.a0 = 4;
+    tf.a0 = 1;
     tf.a1 = sizeof(recv);
     mq_h = syscall_dispatch(&tf, td);
     SELFTEST_ASSERT(mq_h >= 0, 9);
@@ -778,9 +945,35 @@ static i32 test_pse51_timer_mqueue_profile(void)
     tf.a4 = (u64) (va + 48);
     SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 18);
 
+    SELFTEST_ASSERT(copy_to_user(va, msg, sizeof(msg)) == 0, 19);
+    tf.a7 = SYS_MQ_SEND;
+    tf.a0 = (u64) mq_h;
+    tf.a1 = (u64) va;
+    tf.a2 = sizeof(msg);
+    tf.a3 = 1;
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 20);
+
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+    SELFTEST_ASSERT(copy_to_user(va + 48, &ts, sizeof(ts)) == 0, 21);
+    tf.a7 = SYS_MQ_TIMEDSEND;
+    tf.a0 = (u64) mq_h;
+    tf.a1 = (u64) va;
+    tf.a2 = sizeof(msg);
+    tf.a3 = 2;
+    tf.a4 = (u64) (va + 48);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == -(i64) ETIMEDOUT, 22);
+
+    tf.a7 = SYS_MQ_RECEIVE;
+    tf.a0 = (u64) mq_h;
+    tf.a1 = (u64) (va + 16);
+    tf.a2 = sizeof(recv);
+    tf.a3 = (u64) (va + 32);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == (i64) sizeof(msg), 23);
+
     tf.a7 = SYS_MQ_CLOSE;
     tf.a0 = (u64) mq_h;
-    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 19);
+    SELFTEST_ASSERT(syscall_dispatch(&tf, td) == 0, 24);
 
     free_proc_and_task(p, td);
     return 0;

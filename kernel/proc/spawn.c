@@ -41,7 +41,7 @@ static i32 fa_open(struct proc *child, i32 fd, char *kpath, sz pathlen)
     if (fres.is_error)
         return -(i32) fres.code;
     i32 rc = cap_open_vfs(child, result_vfs_file_checked(fres), rights,
-                          is_seekable, fd, true);
+                          is_seekable, 0, fd, true);
     return rc < 0 ? rc : 0;
 }
 

@@ -18,6 +18,11 @@
 #define MQ_MAX_QUEUES 8
 #define MQ_MAX_MSGS 16
 #define MQ_MAX_MSG_SIZE 256
+/* POSIX requires _POSIX_MQ_PRIO_MAX >= 32 (priorities run [0, MQ_PRIO_MAX)).
+ * Mazu picks the minimum so message storage stays compact while remaining
+ * conformant; mq_send/mq_timedsend reject priorities outside this range.
+ */
+#define MQ_PRIO_MAX 32
 
 struct mq_msg {
     u8 data[MQ_MAX_MSG_SIZE];
@@ -67,15 +72,30 @@ void mqueue_put_idx(i32 handle);
  */
 bool mqueue_inc_idx(i32 handle);
 
+/* Read the per-queue mq_msgsize.  Returns the size in bytes, or a negative
+ * value if the handle is invalid.  The syscall layer uses this to enforce
+ * the POSIX "receive buffer must be >= mq_msgsize" rule before calling into
+ * mqueue_receive / mqueue_timedreceive.
+ */
+sz mqueue_get_msgsize(i32 handle);
+
 /* Send a message.  Blocks if queue is full.
  * Returns 0 on success, -EMSGSIZE if msg too large.
  */
 i32 mqueue_send(i32 handle, const void *msg, sz len, u32 priority);
+i32 mqueue_trysend(i32 handle, const void *msg, sz len, u32 priority);
+
+i32 mqueue_timedsend(i32 handle,
+                     const void *msg,
+                     sz len,
+                     u32 priority,
+                     struct time_ms timeout);
 
 /* Receive the highest-priority message.  Blocks if queue is empty.
  * Returns message length on success, or -errno.
  */
 i32 mqueue_receive(i32 handle, void *buf, sz buf_size, u32 *out_priority);
+i32 mqueue_tryreceive(i32 handle, void *buf, sz buf_size, u32 *out_priority);
 
 /* Receive with timeout.  Returns message length, -ETIMEDOUT, or -errno. */
 i32 mqueue_timedreceive(i32 handle,
