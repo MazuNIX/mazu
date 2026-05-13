@@ -1,0 +1,50 @@
+CONTRIBUTING.md
+  ai_agent 50
+docs/security.md
+  s_a0f5c92989d43c::t_6dd35d5ae2fc3c 48-67,70-71
+  s_a0f5c92989d43c::t_ad08ffe64ce11b 1-47,68-69,72-94
+docs/debugging.md
+  s_a0f5c92989d43c::t_028484f13a931e 18-20,24-25
+  s_a0f5c92989d43c::t_86e2bd1d1378b8 53-57
+  s_a0f5c92989d43c::t_35465228dd9c5d 61-67,71-76
+  s_a0f5c92989d43c::t_f4a7cbaaa68570 86-89
+  s_a0f5c92989d43c::t_66edb5d4737034 40-42
+  s_a0f5c92989d43c::t_8fd7afbb1b05cd 1-17,21-23,26-39,43-52,58-60,68-70,77-85
+README.md
+  s_a0f5c92989d43c::t_982c8eef260304 4-15,18-23,25-28,33-53,55-90,93-96,98,100-101,103,107,118-124,126-127,129-132,146-166,171-173
+docs/pse51-matrix.md
+  s_a0f5c92989d43c::t_9dfecccc58d21e 269-310
+docs/design.md
+  s_a0f5c92989d43c::t_5c7e0d97351b3f 1-48,54,66-101,108,114,121,125,130-132
+  s_a0f5c92989d43c::t_aa7ead2ee9655d 49-53
+  s_a0f5c92989d43c::t_d26c6680a4907e 55-65
+  s_a0f5c92989d43c::t_24038d5bd00e68 102-107,109-113,115-120,122-124,126-129,133-136
+docs/internals.md
+  s_a0f5c92989d43c::t_28bb6cdedd2477 1-27,42-204,245,273,296,303-435,440,459-483
+  s_a0f5c92989d43c::t_8de130c6f6dc7f 210,214,238-239,244,289
+  s_a0f5c92989d43c::t_11c33ae67e4fbf 436-439,441-458
+  s_a0f5c92989d43c::t_257be9e97ed48a 28-41
+  s_a0f5c92989d43c::t_bdb3435040fb72 294,297-302
+  s_a0f5c92989d43c::t_915f27d38c8ac8 205-209,211-213,215-237,240-243,246-272,274-288,290-293,295
+docs/build.md
+  s_a0f5c92989d43c::t_b6f7eec64fe803 37-39,41-42,44,48-49,51-53,57-61
+  s_a0f5c92989d43c::t_09a318bc3067d0 25
+  s_a0f5c92989d43c::t_dd86cf939de50b 26
+  s_a0f5c92989d43c::t_ab6a71205faf65 1-24,27-36,40,43,45-47,50,54-56,62-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0c5e9d2dc4fb9252a2a48dc27a0933dd8ee5ddf4",
+  "prompts": {},
+  "sessions": {
+    "s_a0f5c92989d43c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "082072d2-88a6-4abb-a1b1-25e4690eda87",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
