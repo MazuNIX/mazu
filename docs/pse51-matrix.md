@@ -266,21 +266,45 @@ work. They are part of the product, not optional compatibility extensions.
 
 ## Gating future "PSE51 complete" milestones
 
-The bounded multi-threaded process model is in place: per-thread
-state migration (signal pending/blocked, signal-frame chain, robust
-futex list, errno TLS), the user-visible pthread surface
-(`SYS_THREAD_CREATE` and friends, `PROC_THREAD_MAX = 4`), and the
-`pthread_attr_*` library have all landed. A future user-mode
-`pthread_create` wrapper can honor `PTHREAD_EXPLICIT_SCHED` without
-the `SETSCHEDPARAM`-after-create race window by switching from
-`SYS_THREAD_CREATE` to `SYS_THREAD_CREATE_EXPLICIT` and passing the
-resolved priority in a2 as (prio + 1). Future `pthread_mutex_*` and
-`pthread_cond_*` wrappers should likewise converge on the futex PI ABI
-(`FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`, `FUTEX_CMP_REQUEUE_PI`) rather
-than introducing a third synchronization path on top of the existing
-kernel-handle and futex mechanisms. `FUTEX_LOCK_PI` already returns
-`-EOWNERDEAD` when the prior owner died holding the lock and
-preserves `FUTEX_OWNER_DIED` in the futex word, so a future
-robust-mutex wrapper can call `pthread_mutex_consistent` from that
-errno without a separate kernel ABI; `FUTEX_CMP_REQUEUE_PI` rejects
-`uaddr1 == uaddr2` with EINVAL.
+The kernel ABI is feature-complete (see Conformance status above).
+What remains is a userspace libc that exposes the standard `pthread_*`
+C entry points on top of that ABI without weakening any kernel
+invariant. The gating items below are wrapper-side, not kernel-side.
+
+1. `pthread_create` wrapper.
+
+   Build it on top of `SYS_THREAD_CREATE_EXPLICIT` rather than
+   `SYS_THREAD_CREATE`. The explicit variant takes the resolved
+   priority in `a2` encoded as `prio + 1` (`0` means inherit), so a
+   `PTHREAD_EXPLICIT_SCHED` attribute is honored atomically at
+   creation. The two-call `SYS_THREAD_CREATE` + `SYS_SCHED_SETPARAM`
+   shape has a race window where the new thread can run at the
+   creator's priority before its requested priority takes effect; the
+   explicit syscall closes that gap. The `pthread_attr_resolve_*`
+   helpers in `include/mazu/pthread.h` already produce the correct
+   syscall number and `a2` encoding for a given `pthread_attr_t`.
+
+2. `pthread_mutex_*` and `pthread_cond_*` wrappers.
+
+   Implement them on top of the existing futex PI ABI (`FUTEX_LOCK_PI`,
+   `FUTEX_UNLOCK_PI`, `FUTEX_CMP_REQUEUE_PI`) rather than introducing a
+   third synchronization path on top of the existing kernel-handle
+   path. Two-path consolidation matters more than a third path's
+   incremental ergonomics: the kernel-handle and futex mechanisms
+   already cover every required semantic.
+
+3. Robust-mutex wrapper.
+
+   `FUTEX_LOCK_PI` already returns `-EOWNERDEAD` when the prior owner
+   died holding the lock and preserves `FUTEX_OWNER_DIED` in the futex
+   word (`kernel/sync/futex.c`). A `pthread_mutex_consistent`-style
+   recovery path can be implemented entirely in userspace from that
+   errno without a new kernel ABI surface. `FUTEX_CMP_REQUEUE_PI`
+   already rejects `uaddr1 == uaddr2` with `EINVAL`, so a
+   `pthread_cond_broadcast` wrapper that requeues onto a PI mutex
+   cannot trip the degenerate self-requeue case.
+
+Out of scope for "PSE51 complete": named POSIX shared-memory objects
+(`shm_open`), file-mapped memory (`_POSIX_MAPPED_FILES`), and named
+message queues. These are listed under Deliberate deviations and stay
+out of scope because they conflict with the shared-page-table design.
