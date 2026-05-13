@@ -1,0 +1,21 @@
+include/mazu/errordef.h
+  s_98b7c727368abe::t_a484720cd4d712 212-215
+kernel/sync/condvar.c
+  s_98b7c727368abe::t_114f8f53288751 131-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "f63ee61f53aa27972d9d4e40fdc4ffa079378cf3",
+  "prompts": {},
+  "sessions": {
+    "s_98b7c727368abe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ea8c11b-3af6-4143-b8f2-83d24d9e2b56",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
