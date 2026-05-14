@@ -59,43 +59,6 @@ static_assert(CONFIG_SCHED_NPRIO <= U32_WIDTH,
               "CONFIG_SCHED_NPRIO must fit "
               "runq_bitmap width");
 
-#if CONFIG_SCHED_EEVDF
-/* Per-CPU minimum vruntime floor: monotonically increasing lower bound.
- * New/waking tasks are initialized to min_vruntime so they neither
- * starve existing tasks nor get an unfair head start.
- */
-static u64 pcpu_min_vruntime[MAX_CPUS];
-
-/* Compute the virtual slice for a task (in timer ticks).
- * Derives from the task's quantum: quantum * 10ms.  The idle thread keeps
- * td_quantum == 0, so clamp it to one slice for EEVDF bookkeeping.
- */
-static inline u64 eevdf_virtual_slice(struct sched_task *task)
-{
-    u64 q = task->td_quantum > 0 ? task->td_quantum : 1;
-    return time_ms_to_ticks(q * 10);
-}
-
-#if CONFIG_SMP
-/* Normalize a task's vruntime when migrating between CPUs.
- * Subtracts the source CPU's floor and adds the destination CPU's
- * floor, so the task's relative position in the vruntime timeline
- * is preserved.  Recomputes the virtual deadline from the new base.
- */
-static void eevdf_normalize_vruntime(struct sched_task *task,
-                                     u32 src_cpu,
-                                     u32 dst_cpu)
-{
-    if (task->vruntime > pcpu_min_vruntime[src_cpu])
-        task->vruntime = pcpu_min_vruntime[dst_cpu] +
-                         (task->vruntime - pcpu_min_vruntime[src_cpu]);
-    else
-        task->vruntime = pcpu_min_vruntime[dst_cpu];
-    task->vdeadline = task->vruntime + eevdf_virtual_slice(task);
-}
-#endif /* CONFIG_SMP */
-#endif
-
 /* Per-hart idle tasks.  BSP uses idle_tasks[0], secondaries use
  * idle_tasks[cpuid].  Statically allocated so they don't need
  * guard-page unmapping.
@@ -200,19 +163,6 @@ static void sched_enqueue_cpu_locked(struct sched_task *task, u32 cpu)
 
     sched_set_task_state(task, TD_STATE_READY);
 
-#if CONFIG_SCHED_EEVDF
-    /* Clamp vruntime to the per-CPU floor so new/waking tasks don't
-     * get an unfair advantage over tasks already in the queue.
-     */
-    if (task->vruntime < pcpu_min_vruntime[cpu])
-        task->vruntime = pcpu_min_vruntime[cpu];
-    /* Only assign a new deadline when the previous slice is fully
-     * consumed.  If a task was preempted mid-slice, keep its existing
-     * deadline so it doesn't get unfairly pushed back.
-     */
-    if (task->vruntime >= task->vdeadline)
-        task->vdeadline = task->vruntime + eevdf_virtual_slice(task);
-#endif
     list_add_tail(&pcpu_runq[cpu][task->td_prio], &task->sleep_list);
     pcpu_runq_bitmap[cpu] |= BIT(task->td_prio);
     if (task->td_prio > SCHED_PRIO_IDLE)
@@ -347,13 +297,9 @@ static struct sched_task *sched_dequeue_task_locked(struct sched_task *task,
 
 /* Pick the highest-priority runnable task from a specific CPU's queue.
  * Caller holds pcpu_runq_lock[cpu].  Returns NULL if no suitable task.
- *
- * When CONFIG_SCHED_EEVDF is enabled, within the highest non-idle
- * priority level the eligible task with earliest virtual deadline is
- * selected.  A task is eligible when its vruntime <= avg_vruntime
- * (hasn't consumed more than its fair share).  Idle-priority tasks
- * and non-EEVDF builds use plain FIFO.
- * Priority levels still dominate: a higher-priority task always wins.
+ * Priority levels still dominate: a higher-priority task always wins,
+ * and equal-priority tasks rotate FIFO by quantum expiry or voluntary
+ * yield.
  */
 static struct sched_task *sched_pick_from_cpu_locked(u32 cpu)
 {
@@ -368,74 +314,10 @@ static struct sched_task *sched_pick_from_cpu_locked(u32 cpu)
     struct sched_task *task;
     while (bm) {
         int p = 31 - __builtin_clz(bm);
-
-#if CONFIG_SCHED_EEVDF
-        /* EEVDF applies only to non-idle priorities.  Idle tasks
-         * use FIFO - the idle loop is not a fairness workload.
-         */
-        if (p > SCHED_PRIO_IDLE) {
-            /* Pass 1: compute average vruntime for eligibility.
-             * Use differences from min_vruntime base to prevent
-             * overflow when summing absolute vruntimes.
-             */
-            u64 base = pcpu_min_vruntime[cpu];
-            u64 sum_diff = 0;
-            u32 count = 0;
-            list_for_each_entry_safe (&pcpu_runq[cpu][p], task,
-                                      struct sched_task, sleep_list) {
-                /* Clamp negative deltas to 0 (possible after cross-CPU
-                 * migration).
-                 */
-                if (task->vruntime >= base)
-                    sum_diff += task->vruntime - base;
-                count++;
-            }
-
-            if (count == 0)
-                goto next_prio;
-
-            u64 avg_vr = base + sum_diff / count;
-
-            /* Pass 2: among eligible tasks (vruntime <= avg),
-             * pick the one with earliest virtual deadline.
-             * Track min-vruntime task as fallback.
-             */
-            struct sched_task *best = NULL;
-            struct sched_task *fallback = NULL;
-            list_for_each_entry_safe (&pcpu_runq[cpu][p], task,
-                                      struct sched_task, sleep_list) {
-                if (task->vruntime <= avg_vr) {
-                    if (!best || task->vdeadline < best->vdeadline)
-                        best = task;
-                }
-                if (!fallback || task->vruntime < fallback->vruntime)
-                    fallback = task;
-            }
-
-            struct sched_task *pick = best ? best : fallback;
-            if (!pick)
-                goto next_prio;
-            sched_dequeue_task_locked(pick, cpu);
-            /* Advance min_vruntime floor monotonically using the
-             * true minimum remaining in the queue.
-             */
-            if (fallback && fallback->vruntime > pcpu_min_vruntime[cpu])
-                pcpu_min_vruntime[cpu] = fallback->vruntime;
-            return pick;
-        }
-#endif /* CONFIG_SCHED_EEVDF */
-
-        /* FIFO dequeue: used for idle-priority (EEVDF) or all
-         * priorities (non-EEVDF).
-         */
         list_for_each_entry_safe (&pcpu_runq[cpu][p], task, struct sched_task,
                                   sleep_list) {
             return sched_dequeue_task_locked(task, cpu);
         }
-
-#if CONFIG_SCHED_EEVDF
-    next_prio:
-#endif
         bm &= ~BIT(p);
     }
     return NULL;
@@ -502,9 +384,6 @@ static struct sched_task *sched_pick_next_local(u32 cpuid)
                               &idle_fallback->sleep_list);
                 pcpu_runq_bitmap[cpuid] |= BIT(idle_fallback->td_prio);
             }
-#if CONFIG_SCHED_EEVDF
-            eevdf_normalize_vruntime(stolen, i, cpuid);
-#endif
             sched_dequeue_telemetry(stolen, i);
             return stolen;
         }
@@ -662,17 +541,6 @@ struct sched_task *sched_schedule(struct sched_task *old)
      * last_activity_ms.
      */
     __atomic_store_n(&pc->heartbeat_stamp, ctxsw_start, __ATOMIC_RELAXED);
-
-#if CONFIG_SCHED_EEVDF
-    /* Charge vruntime BEFORE enqueue so the pick-next sees an
-     * up-to-date vruntime and vdeadline for the outgoing task.
-     * Skip idle tasks - they use FIFO, not EEVDF.
-     */
-    if (old->td_prio > SCHED_PRIO_IDLE) {
-        u64 pre_delta = ctxsw_start - old->switch_in_ticks;
-        old->vruntime += pre_delta;
-    }
-#endif
 
 #if CONFIG_SCHED_DEADLINE
     /* Charge DL budget on context switch out.  May throttle the task. */
@@ -2394,9 +2262,6 @@ static void sched_load_balance(void *ctx __unused)
         lockdep_release(LOCK_LEVEL_SCHED);
 
         if (victim) {
-#if CONFIG_SCHED_EEVDF
-            eevdf_normalize_vruntime(victim, busiest_cpu, idlest_cpu);
-#endif
             /* Enqueue to idlest CPU and wake it. */
             lockdep_acquire(LOCK_LEVEL_SCHED);
             flags = spin_lock_irqsave(&pcpu_runq_lock[idlest_cpu]);

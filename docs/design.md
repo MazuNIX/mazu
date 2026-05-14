@@ -66,8 +66,9 @@ cost in release).
 
 The scheduler is unconditionally preemptive: `CONFIG_SCHED_PREEMPTIVE` is
 mandatory, and the build fails if someone tries to disable it. Every trap
-exit drains `need_resched` via an atomic exchange. EEVDF provides fairness
-within priority levels. EDF deadline scheduling with admission control and
+exit drains `need_resched` via an atomic exchange. Priority levels
+dominate dispatch, and equal-priority peers rotate by bounded
+timer-driven quanta. EDF deadline scheduling with admission control and
 budget enforcement targets hard-deadline workloads. Mixed-criticality
 scheduling domains partition CPU time between high-criticality (control)
 and low-criticality (web/telemetry) task groups with automatic escalation

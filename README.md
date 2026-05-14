@@ -57,9 +57,9 @@ Mazu-specific ABI shape rather than the exact POSIX shape, is tracked in
 ## Core capabilities
 
 - Hard-RT scheduling: mandatory kernel preemption, SMP per-CPU run
-  queues, EEVDF fairness, EDF deadline scheduling with admission
-  control, mixed-criticality domains, load balancing, scheduling domains
-  with budget enforcement.
+  queues, bounded-quantum rotation among equal-priority threads, EDF
+  deadline scheduling with admission control, mixed-criticality
+  domains, load balancing, scheduling domains with budget enforcement.
 - SMP by design: per-hart state via `gp` register, per-CPU run queues
   and merged deadline management, lockdep lock-ordering enforcement,
   cache-line-aligned per-CPU structures.

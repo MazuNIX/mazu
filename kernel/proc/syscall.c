@@ -3645,10 +3645,8 @@ static i64 sys_thread_getschedparam_h(struct trap_frame *tf,
 /* sched_setscheduler / sched_getscheduler. Mazu has one effective
  * normal-thread policy: priority-dominated dispatch with quantum-based rotation
  * among equal-priority runnable tasks. SCHED_OTHER and SCHED_RR are accepted
- * but treated as SCHED_FIFO at the ABI boundary. When CONFIG_SCHED_EEVDF is
- * enabled, EEVDF only changes which equal-priority task is picked next; it does
- * not replace the quantum-driven rotation. The deadline class has its own ABI
- * (SYS_SCHED_SETATTR) and is not selectable here.
+ * but treated as SCHED_FIFO at the ABI boundary. The deadline class has its
+ * own ABI (SYS_SCHED_SETATTR) and is not selectable here.
  *
  * a0 = pid (0 = self), a1 = policy, a2 = priority. When a1==-1 the call is a
  * get rather than a set; the tristate keeps the syscall count flat and matches
@@ -3672,8 +3670,9 @@ static i64 sys_sched_setscheduler_h(struct trap_frame *tf,
     if ((u8) prio > td->td_base_prio)
         return -(i64) EPERM;
 
-    /* Coerce all three policies to the single supported mapping; the policy
-     * argument is preserved purely for the matching getter.
+    /* All three accepted policies coerce to the single supported normal-thread
+     * mapping; the requested policy is discarded and sys_sched_getscheduler
+     * always reports SCHED_FIFO.
      */
     u16 pid = (u16) raw_pid;
     if (pid == 0) {
