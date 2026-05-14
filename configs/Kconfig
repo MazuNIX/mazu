@@ -37,21 +37,6 @@ menu "Scheduler"
         default 4
         range 2 16
 
-    config SCHED_EEVDF
-        bool "EEVDF fair scheduling within priority levels"
-        default y
-        depends on SCHED_PREEMPTIVE
-        help
-          Earliest Eligible Virtual Deadline First scheduling within
-          each priority level. Each task gets a virtual deadline based
-          on its time slice; eligible tasks (those that haven't consumed
-          more than their fair share) are scheduled by earliest deadline.
-          This bounds wake-to-run latency proportional to the slice,
-          preventing starvation among equal-priority tasks (e.g., many
-          web-handler tasks). Priority levels still dominate: higher-
-          priority tasks always preempt. Default bitmap is better for
-          deterministic RT workloads with few tasks.
-
     config SCHED_DEADLINE
         bool "SCHED_DEADLINE (EDF) scheduling policy"
         default n
@@ -59,7 +44,7 @@ menu "Scheduler"
         help
           Earliest Deadline First scheduling for hard-RT tasks with
           explicit deadline parameters (runtime, deadline, period).
-          Deadline tasks always preempt EEVDF/FIFO/RR tasks.
+          Deadline tasks always preempt normal-thread tasks.
           Admission control rejects task sets that exceed a
           configurable utilization threshold.
 

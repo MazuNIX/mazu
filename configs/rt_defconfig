@@ -1,8 +1,7 @@
 # Mazu RT configuration
-# Real-time bundle (EEVDF + SMP), latency measurement, semihosting
+# Real-time bundle (SMP), latency measurement, semihosting
 CONFIG_CPU_MAX=4
 CONFIG_SMP=y
-CONFIG_SCHED_EEVDF=y
 CONFIG_MEASURE_LATENCY=y
 CONFIG_NET_UDP=y
 # CONFIG_DHCP is not set

@@ -2,7 +2,6 @@
 # Hard-RT baseline: SMP, latency tracing, rich TCP/IP, virtio-blk, semihosting
 CONFIG_SMP=y
 CONFIG_CPU_MAX=4
-CONFIG_SCHED_EEVDF=y
 CONFIG_SCHED_DEADLINE=y
 CONFIG_MIXED_CRIT=y
 CONFIG_MEASURE_LATENCY=y

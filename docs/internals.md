@@ -53,11 +53,11 @@ Mazu ships only hard-RT scheduling profiles:
 Timer-driven quanta force reschedule points at every priority level. When
 `CONFIG_SMP` is enabled, each hart has its own run queue with a per-CPU
 lock, an idle-steal path for pull migration, and a periodic load balancer
-using exponential-decay estimation. Optional EEVDF fair scheduling
-(`CONFIG_SCHED_EEVDF`) bounds wake-to-run latency within each priority
-level. Deadline scheduling and mixed-criticality extensions build on the
-same SMP-first model. Scheduling domains (`struct sched_domain`) enforce
-per-group CPU budgets with automatic refill.
+using exponential-decay estimation. Equal-priority threads rotate by
+FIFO order under timer-driven quanta. Deadline scheduling and
+mixed-criticality extensions build on the same SMP-first model.
+Scheduling domains (`struct sched_domain`) enforce per-group CPU budgets
+with automatic refill.
 
 Kernel services are driven by scheduler tasks created during boot. Typical
 long-lived tasks include:

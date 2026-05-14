@@ -141,9 +141,11 @@
 #define SYS_THREAD_GETSCHEDPARAM 86
 
 /* POSIX scheduler-policy accessors (sched_{setscheduler,getscheduler}). Mazu
- * honors SCHED_FIFO semantics for all normal threads; SCHED_OTHER and SCHED_RR
- * are accepted but coerced to FIFO. SCHED_DEADLINE is rejected here because it
- * has its own ABI via SYS_SCHED_SETATTR.
+ * exposes one normal-thread policy: priority-dominated dispatch with
+ * quantum-based rotation among equal-priority peers. SCHED_OTHER and SCHED_RR
+ * are accepted for compatibility and coerced to SCHED_FIFO at the kernel
+ * boundary. SCHED_DEADLINE is rejected here because it has its own ABI via
+ * SYS_SCHED_SETATTR.
  */
 #define SYS_SCHED_SETSCHEDULER 87
 #define SYS_SCHED_GETSCHEDULER 88
@@ -205,8 +207,8 @@
 #define PTHREAD_CANCEL_ENABLE 0
 #define PTHREAD_CANCEL_DISABLE 1
 
-/* POSIX scheduling policies (subset). SCHED_FIFO is the only policy Mazu honors
- * directly; SCHED_OTHER and SCHED_RR map onto it.
+/* POSIX scheduling policies (subset). SCHED_FIFO names Mazu's single
+ * normal-thread policy; SCHED_OTHER and SCHED_RR map onto it.
  */
 #define SCHED_OTHER 0
 #define SCHED_FIFO 1

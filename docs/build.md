@@ -22,8 +22,8 @@ to the kernel image.
 
 | Defconfig | Description |
 |-----------|-------------|
-| `configs/defconfig` | Default hard-RT profile: SMP, EEVDF + EDF, mixed-criticality, latency tracing, TCP + SACK, UDP, mDNS, virtio-blk, semihosting (DHCP disabled; configure statically via `rootfs/config.txt`) |
-| `configs/rt_defconfig` | Leaner RT validation profile: SMP, EEVDF, latency tracing, UDP + mDNS, TCP + SACK, semihosting (no EDF, no mixed-criticality, no virtio-blk) |
+| `configs/defconfig` | Default hard-RT profile: SMP, EDF, mixed-criticality, latency tracing, TCP + SACK, UDP, mDNS, virtio-blk, semihosting (DHCP disabled; configure statically via `rootfs/config.txt`) |
+| `configs/rt_defconfig` | Leaner RT validation profile: SMP, latency tracing, UDP + mDNS, TCP + SACK, semihosting (no EDF, no mixed-criticality, no virtio-blk) |
 
 ## Reusable configuration fragments
 
@@ -44,7 +44,6 @@ several Kconfig defaults).
 | `CONFIG_TCP_SACK` | y | TCP selective acknowledgment (RFC 2018) |
 | `CONFIG_WEBSOCKET` | y | WebSocket upgrade path (SHA-1, Base64, frame codec, PING/PONG/CLOSE) |
 | `CONFIG_SCHED_PREEMPTIVE` | y | Mandatory timer-driven kernel preemption |
-| `CONFIG_SCHED_EEVDF` | y | EEVDF fair scheduling within priority levels |
 | `CONFIG_SCHED_DEADLINE` | y | EDF deadline scheduling with admission control |
 | `CONFIG_MIXED_CRIT` | y | Mixed-criticality scheduling domains with budget enforcement |
 | `CONFIG_SMP` | y | Symmetric multiprocessing (per-CPU run queues, load balancing) |

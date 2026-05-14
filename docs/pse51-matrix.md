@@ -172,7 +172,7 @@ sync handle table (`kernel/sync/sync_handle.c`).
 | `sched_get_priority_max` | `SYS_SCHED_GET_PRIORITY_MAX` | implemented | Returns `CONFIG_SCHED_NPRIO - 1`. |
 | `sched_setparam` | `SYS_SCHED_SETPARAM` | implemented-with-mazu-abi | ABI takes a scalar priority `i32`. Cannot raise above caller's base priority. |
 | `sched_getparam` | `SYS_SCHED_GETPARAM` | implemented-with-mazu-abi | Returns scalar base priority. |
-| `sched_setscheduler` / `_getscheduler` | `SYS_SCHED_SETSCHEDULER` / `_GETSCHEDULER` | implemented-with-mazu-abi | Accepts `SCHED_FIFO` / `SCHED_OTHER` / `SCHED_RR` and coerces all three to `SCHED_FIFO` since Mazu honors a single effective policy for normal threads. The matching getter always reports `SCHED_FIFO`. `SYS_SCHED_SETATTR` / `_GETATTR` cover the deadline path. |
+| `sched_setscheduler` / `_getscheduler` | `SYS_SCHED_SETSCHEDULER` / `_GETSCHEDULER` | implemented-with-mazu-abi | Accepts `SCHED_FIFO` / `SCHED_OTHER` / `SCHED_RR` and coerces all three to `SCHED_FIFO` since Mazu exposes one normal-thread policy: priority-dominated dispatch with quantum-based rotation among equal-priority runnable peers. The matching getter always reports `SCHED_FIFO`. `SYS_SCHED_SETATTR` / `_GETATTR` cover the deadline path. |
 | `sched_setaffinity` / `_getaffinity` | `SYS_SCHED_SETAFFINITY` / `_GETAFFINITY` | implemented | Linux-style `cpumask`. Out of strict PSE51, retained for SMP control. |
 | `sched_rr_get_interval` | (none) | not-applicable | Mazu has no round-robin policy. |
 

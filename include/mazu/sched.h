@@ -221,15 +221,6 @@ struct sched_task {
      */
     u64 load_avg; /* fixed-point Q16 load estimate */
 
-    /* EEVDF scheduling state (Earliest Eligible Virtual Deadline First).
-     * vruntime: accumulated virtual CPU ticks consumed by this task.
-     * vdeadline: vruntime + virtual_slice, set on enqueue.
-     * Pick-next selects the eligible task with earliest vdeadline within each
-     * priority level, bounding wake-to-run latency to one slice.
-     */
-    u64 vruntime;
-    u64 vdeadline;
-
 #ifdef CONFIG_SCHED_DEADLINE
     u8 td_policy; /* SCHED_POLICY_NORMAL or SCHED_POLICY_DEADLINE */
     struct sched_dl_entity

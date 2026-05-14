@@ -482,79 +482,113 @@ static i32 test_watchdog_activity(void)
 }
 DEFINE_SELFTEST(watchdog_activity, test_watchdog_activity);
 
-#if CONFIG_SCHED_EEVDF
-/* EEVDF fairness test: spawn N equal-priority tasks that each run for
- * a fixed number of yield iterations, recording how much CPU time each
- * consumed.  Verify each got roughly 1/N of the total.
- *
- * Workers yield voluntarily (sleep_ms(0)) to avoid starving the
- * IDLE-priority selftest runner.  The yield-count approach measures
- * fairness without requiring the caller to sleep (which would be
- * starved by NORMAL-priority workers).
+/* Quantum rotation fairness: pin N CPU-bound equal-priority workers to one
+ * CPU and assert that no worker's run-to-run latency exceeds (N - 1) quanta
+ * plus QEMU jitter slack. Each worker busy-loops on time_rdtime() and tracks
+ * the largest gap between adjacent samples; while the worker is descheduled
+ * in favor of a peer, that gap equals the peers' combined service time. This
+ * exercises the timer-driven quantum-expiry path, not voluntary yield.
  */
-#define EEVDF_N_TASKS 3
-#define EEVDF_ITERATIONS 50
-static volatile u64 eevdf_cpu_time[EEVDF_N_TASKS];
-static volatile int eevdf_done_count;
+#define QUANTUM_ROTATION_N_TASKS 3
+#define QUANTUM_ROTATION_DURATION_MS 300
+static volatile u64 quantum_rotation_max_gap_ticks[QUANTUM_ROTATION_N_TASKS];
+static volatile u64 quantum_rotation_iterations[QUANTUM_ROTATION_N_TASKS];
+static volatile u64 quantum_rotation_deadline_ticks;
+static volatile u32 quantum_rotation_done_count;
 
-static void eevdf_worker_cb(void *arg)
+static void quantum_rotation_worker_cb(void *arg)
 {
-    int slot = (int) (uptr) arg;
-    struct sched_task *td = get_pcpu()->curthread;
+    u32 slot = (u32) (uptr) arg;
+    u64 deadline =
+        __atomic_load_n(&quantum_rotation_deadline_ticks, __ATOMIC_ACQUIRE);
+    u64 prev = time_rdtime();
+    u64 max_gap = 0;
+    u64 iter = 0;
 
-    for (int i = 0; i < EEVDF_ITERATIONS; i++)
-        sleep_ms(time_ms_new(0)); /* yield */
+    /* CPU-bound: no yield, no sleep. Preemption comes from quantum expiry. */
+    for (;;) {
+        u64 now = time_rdtime();
+        if (now >= deadline)
+            break;
+        u64 gap = now - prev;
+        if (gap > max_gap)
+            max_gap = gap;
+        prev = now;
+        iter++;
+    }
 
-    eevdf_cpu_time[slot] = td->cpu_time_us;
-    __atomic_fetch_add(&eevdf_done_count, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&quantum_rotation_max_gap_ticks[slot], max_gap,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&quantum_rotation_iterations[slot], iter,
+                     __ATOMIC_RELEASE);
+    __atomic_fetch_add(&quantum_rotation_done_count, 1, __ATOMIC_RELEASE);
 }
 
-static i32 test_eevdf_fairness(void)
+static i32 test_quantum_rotation_fairness(void)
 {
-    eevdf_done_count = 0;
-    for (int i = 0; i < EEVDF_N_TASKS; i++)
-        eevdf_cpu_time[i] = 0;
-
-    /* Create N workers at NORMAL priority. */
-    for (int i = 0; i < EEVDF_N_TASKS; i++) {
-        struct result r = sched_create_impl(eevdf_worker_cb, (void *) (uptr) i,
-                                            SCHED_PRIO_NORMAL, -1);
-        if (r.is_error)
-            return 1;
-    }
-
-    /* Wait for all workers to finish (up to 5s). */
-    u64 start = time_rdtime();
-    u64 timeout = time_ms_to_ticks(5000);
-    while (__atomic_load_n(&eevdf_done_count, __ATOMIC_ACQUIRE) <
-           EEVDF_N_TASKS) {
-        if (time_rdtime() - start > timeout)
-            return 1; /* timed out */
-        sleep_ms(time_ms_new(10));
-    }
-
-    /* Each worker ran EEVDF_ITERATIONS yields.  Under EEVDF, the CPU
-     * time should be distributed roughly equally.  Allow wide tolerance
-     * (each gets at least 5% and at most 80%) for QEMU SMP jitter —
-     * tasks can land on different harts with uneven interrupt load.
+    /* sched_default_quantum[SCHED_PRIO_NORMAL] = 1 (one 10ms tick). */
+    const u64 quantum_ticks = time_ms_to_ticks(10);
+    /* Nominal worst case is (N - 1) * quantum. Two extra quanta of slack
+     * absorb QEMU mtimer jitter and callout coalescing observed under
+     * concurrent selftest load; this still rejects a full extra rotation
+     * (which would cost N * quantum, exceeding the cap) so an equal-priority
+     * fairness regression cannot slip past. The companion lower-bound
+     * assertion below catches degenerate "worker ran without preemption"
+     * cases that a loose upper bound alone would miss.
      */
-    u64 total = 0;
-    for (int i = 0; i < EEVDF_N_TASKS; i++)
-        total += eevdf_cpu_time[i];
+    const u64 max_allowed_ticks =
+        (QUANTUM_ROTATION_N_TASKS - 1) * quantum_ticks + 2 * quantum_ticks;
+    const u64 duration_ticks = time_ms_to_ticks(QUANTUM_ROTATION_DURATION_MS);
 
-    if (total == 0)
-        return 1; /* workers never accumulated CPU time */
+    __atomic_store_n(&quantum_rotation_done_count, 0, __ATOMIC_RELAXED);
+    for (u32 i = 0; i < QUANTUM_ROTATION_N_TASKS; i++) {
+        quantum_rotation_max_gap_ticks[i] = 0;
+        quantum_rotation_iterations[i] = 0;
+    }
+    __atomic_store_n(&quantum_rotation_deadline_ticks,
+                     time_rdtime() + duration_ticks, __ATOMIC_RELEASE);
 
-    for (int i = 0; i < EEVDF_N_TASKS; i++) {
-        u64 pct = (eevdf_cpu_time[i] * 100) / total;
-        if (pct < 5 || pct > 80)
+    disable_interrupts();
+    for (u32 i = 0; i < QUANTUM_ROTATION_N_TASKS; i++) {
+        struct result r =
+            sched_create_impl(quantum_rotation_worker_cb, (void *) (uptr) i,
+                              SCHED_PRIO_NORMAL, 0);
+        if (r.is_error) {
+            enable_interrupts();
+            return 1;
+        }
+    }
+    enable_interrupts();
+
+    /* This test task runs at SCHED_PRIO_IDLE, so it cannot preempt the
+     * NORMAL-priority workers; sleep_ms parks it until they finish.
+     */
+    u64 watchdog_deadline =
+        time_rdtime() + duration_ticks + time_ms_to_ticks(2000);
+    while (__atomic_load_n(&quantum_rotation_done_count, __ATOMIC_ACQUIRE) <
+           QUANTUM_ROTATION_N_TASKS) {
+        if (time_rdtime() > watchdog_deadline)
+            return 1;
+        sleep_ms(time_ms_new(50));
+    }
+
+    for (u32 i = 0; i < QUANTUM_ROTATION_N_TASKS; i++) {
+        if (__atomic_load_n(&quantum_rotation_iterations[i],
+                            __ATOMIC_ACQUIRE) == 0)
+            return 1;
+        u64 gap = __atomic_load_n(&quantum_rotation_max_gap_ticks[i],
+                                  __ATOMIC_ACQUIRE);
+        /* Each worker must have been descheduled at least once (proves it
+         * was not starved before first dispatch and ran in true rotation,
+         * not solo); and the worst service gap stays within the bound.
+         */
+        if (gap < quantum_ticks || gap > max_allowed_ticks)
             return 1;
     }
 
     return 0;
 }
-DEFINE_SELFTEST(eevdf_fairness, test_eevdf_fairness);
-#endif /* CONFIG_SCHED_EEVDF */
+DEFINE_SELFTEST(quantum_rotation_fairness, test_quantum_rotation_fairness);
 
 /* Per-hart heartbeat: verify that heartbeat_stamp is updated during
  * scheduling and that sched_get_hart_watchdog reports a valid age.
@@ -633,58 +667,20 @@ static i32 test_sched_domain_basic(void)
 }
 DEFINE_SELFTEST(sched_domain_basic, test_sched_domain_basic);
 
-/* Scheduling domain budget test: a task in a tight-budget domain
- * gets blocked (DEPLETED), then resumes after the refill callout.
+/* Scheduling domain budget test: verify the refill callout restores an
+ * exhausted domain to ACTIVE and clears consumed_ticks for the next period.
  */
-static volatile int domain_worker_iters;
-
-static void domain_worker_cb(void *arg __unused)
-{
-    /* Yield in a loop, counting iterations. */
-    for (int i = 0; i < 200; i++) {
-        __atomic_fetch_add(&domain_worker_iters, 1, __ATOMIC_RELAXED);
-        sleep_ms(time_ms_new(0)); /* yield */
-    }
-}
-
 static i32 test_sched_domain_budget(void)
 {
     struct sched_domain dom;
-    i32 ret = 1;
     /* Small budget: 10ms quantum, 50ms period. */
     u64 quantum = time_ms_to_ticks(10);
     u64 period = time_ms_to_ticks(50);
     sched_domain_init(&dom, quantum, period);
 
-    domain_worker_iters = 0;
-
-    /* Create a worker task pinned to BSP. */
-    struct result r =
-        sched_create_impl(domain_worker_cb, NULL, SCHED_PRIO_NORMAL, 0);
-    if (r.is_error)
-        goto out;
-
-    /* Since cannot easily get a task pointer from sched_create_impl
-     * (it returns result, not task*), verify domain mechanics via
-     * state transitions:
-     * 1. After some time, domain should deplete (consumed >= quantum)
-     * 2. After refill, domain should become ACTIVE again
-     */
-
-    /* Wait for the worker to complete or timeout (3s). */
-    u64 start = time_rdtime();
-    u64 timeout = time_ms_to_ticks(3000);
-    while (__atomic_load_n(&domain_worker_iters, __ATOMIC_RELAXED) < 200) {
-        if (time_rdtime() - start > timeout)
-            break;
-        sleep_ms(time_ms_new(10));
-    }
-
-    if (__atomic_load_n(&domain_worker_iters, __ATOMIC_RELAXED) < 200)
-        goto out;
-
-    /* Verify domain refill mechanics directly: deplete, then check refill.
-     * Use atomic stores to match the ordering used by production code.
+    /* Verify refill mechanics directly. Use atomic stores to match the
+     * ordering used by production code when budget accounting depletes
+     * a domain on context switch.
      */
     __atomic_store_n(&dom.consumed_ticks, dom.quantum_ticks, __ATOMIC_RELAXED);
     __atomic_store_n(&dom.state, DOMAIN_DEPLETED, __ATOMIC_RELEASE);
@@ -694,11 +690,9 @@ static i32 test_sched_domain_budget(void)
 
     if (__atomic_load_n(&dom.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE ||
         __atomic_load_n(&dom.consumed_ticks, __ATOMIC_RELAXED) != 0)
-        goto out;
+        return 1;
 
-    ret = 0;
-out:
     callout_cancel_sync(&dom.refill_callout);
-    return ret;
+    return 0;
 }
 DEFINE_SELFTEST(sched_domain_budget, test_sched_domain_budget);
