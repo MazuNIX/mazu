@@ -1,0 +1,52 @@
+README.md
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 60-62
+configs/Kconfig
+  s_5a15269b70d6c9::t_b2610f1b43cb90 47
+kernel/sched/core.c
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 300-302
+docs/internals.md
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 56-60
+kernel/proc/syscall.c
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 3648-3649
+  s_c1072af58a507f::t_f34bedc398a182 3673-3675
+tests/tests-sched.c
+  s_5a15269b70d6c9::t_b2610f1b43cb90 670-671,681-683,693,696
+  s_c1072af58a507f::t_86f1724d45b8da 485-490,493-496,502-517,520-523,529-530,538-539,541-542,545-546,548-549,563-564,566-567,570,572,576-577
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 492,497-499,501,518,524,527,543-544,551-559,561,568-569,571,575,578,591
+  s_c1072af58a507f::t_b269a841fa3660 531-537,540
+  s_c1072af58a507f::t_cd5feda7a3f87d 579-585
+docs/pse51-matrix.md
+  s_5a15269b70d6c9::t_b2610f1b43cb90 175
+include/mazu/syscall.h
+  s_5a15269b70d6c9::t_b2610f1b43cb90 144-148,210-211
+configs/rt_defconfig
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 2
+docs/build.md
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 25-26
+docs/design.md
+  s_5a15269b70d6c9::t_c49a4cbba6f26a 69-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "a8e63b9b1d3c0c53699c054df88185469850b652",
+  "prompts": {},
+  "sessions": {
+    "s_5a15269b70d6c9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2372-d642-7da1-8ccd-be57743931a0",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    },
+    "s_c1072af58a507f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d9e9515c-dc9c-467f-b6c0-c30539fae4c0",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Jim Huang <jserv@ccns.ncku.edu.tw>"
+    }
+  }
+}
