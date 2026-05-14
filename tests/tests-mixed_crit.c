@@ -2,6 +2,11 @@
 #include <mazu/sched.h>
 #include <mazu/selftest.h>
 
+/* Each test below arms refill callouts on the stack-local hi/lo domains via
+ * sched_domain_init; both callouts must be drained on every exit so they
+ * cannot fire against the unwound stack frame.
+ */
+
 /* Test: MC pair initialization sets criticality fields. */
 static i32 test_mc_init_pair(void)
 {
@@ -11,18 +16,19 @@ static i32 test_mc_init_pair(void)
 
     sched_mc_init_pair(&hi, &lo);
 
+    i32 rc = 0;
     if (hi.criticality != SCHED_DOMAIN_CRIT_HI)
-        return 1;
-    if (lo.criticality != SCHED_DOMAIN_CRIT_LO)
-        return 1;
-    if (hi.mc_peer != &lo || lo.mc_peer != &hi)
-        return 1;
-    if (hi.mc_state != MC_NORMAL || lo.mc_state != MC_NORMAL)
-        return 1;
+        rc = 1;
+    else if (lo.criticality != SCHED_DOMAIN_CRIT_LO)
+        rc = 1;
+    else if (hi.mc_peer != &lo || lo.mc_peer != &hi)
+        rc = 1;
+    else if (hi.mc_state != MC_NORMAL || lo.mc_state != MC_NORMAL)
+        rc = 1;
 
     callout_cancel_sync(&hi.refill_callout);
     callout_cancel_sync(&lo.refill_callout);
-    return 0;
+    return rc;
 }
 DEFINE_SELFTEST(mc_init_pair, test_mc_init_pair);
 
@@ -39,22 +45,24 @@ static i32 test_mc_escalation(void)
                      __ATOMIC_RELAXED);
     sched_mc_check_escalation(&hi);
 
+    i32 rc = 0;
     if (hi.mc_state != MC_ESCALATED)
-        return 1;
-    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_DEPLETED)
-        return 1;
+        rc = 1;
+    else if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_DEPLETED)
+        rc = 1;
+    else {
+        /* Recovery after HI refill. */
+        sched_mc_check_recovery(&hi);
 
-    /* Recovery after HI refill. */
-    sched_mc_check_recovery(&hi);
-
-    if (hi.mc_state != MC_NORMAL)
-        return 1;
-    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
-        return 1;
+        if (hi.mc_state != MC_NORMAL)
+            rc = 1;
+        else if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
+            rc = 1;
+    }
 
     callout_cancel_sync(&hi.refill_callout);
     callout_cancel_sync(&lo.refill_callout);
-    return 0;
+    return rc;
 }
 DEFINE_SELFTEST(mc_escalation, test_mc_escalation);
 
@@ -70,13 +78,14 @@ static i32 test_mc_no_escalation(void)
                      __ATOMIC_RELAXED);
     sched_mc_check_escalation(&hi);
 
+    i32 rc = 0;
     if (hi.mc_state != MC_NORMAL)
-        return 1;
-    if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
-        return 1;
+        rc = 1;
+    else if (__atomic_load_n(&lo.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE)
+        rc = 1;
 
     callout_cancel_sync(&hi.refill_callout);
     callout_cancel_sync(&lo.refill_callout);
-    return 0;
+    return rc;
 }
 DEFINE_SELFTEST(mc_no_escalation, test_mc_no_escalation);

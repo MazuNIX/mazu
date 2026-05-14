@@ -634,36 +634,54 @@ static i32 test_sched_domain_basic(void)
 
     sched_domain_init(&dom, quantum, period);
 
-    if (dom.quantum_ticks != quantum || dom.period_ticks != period)
-        return 1;
-    if (dom.consumed_ticks != 0 || dom.state != DOMAIN_ACTIVE)
-        return 1;
-    if (dom.nr_members != 0)
-        return 1;
+    /* dom.refill_callout is armed by sched_domain_init and holds &dom; every
+     * exit must drain it before this stack frame unwinds.
+     */
+    i32 rc = 0;
+    if (dom.quantum_ticks != quantum || dom.period_ticks != period) {
+        rc = 1;
+        goto out;
+    }
+    if (dom.consumed_ticks != 0 || dom.state != DOMAIN_ACTIVE) {
+        rc = 1;
+        goto out;
+    }
+    if (dom.nr_members != 0) {
+        rc = 1;
+        goto out;
+    }
 
     /* Attach/detach using current task as a guinea pig. */
     struct sched_task *cur = get_pcpu()->curthread;
     struct sched_domain *saved_domain = cur->domain;
 
-    if (sched_domain_attach(&dom, cur) != 0)
-        return 1;
-    if (dom.nr_members != 1 || cur->domain != &dom)
-        return 1;
+    if (sched_domain_attach(&dom, cur) != 0) {
+        rc = 1;
+        goto out;
+    }
+    if (dom.nr_members != 1 || cur->domain != &dom) {
+        rc = 1;
+        goto out_detach;
+    }
 
     sched_domain_detach(cur);
-    if (dom.nr_members != 0 || cur->domain != NULL)
-        return 1;
+    if (dom.nr_members != 0 || cur->domain != NULL) {
+        rc = 1;
+        goto out;
+    }
 
     /* Restore original domain via the proper API. */
     if (saved_domain) {
         if (sched_domain_attach(saved_domain, cur) != 0)
-            return 1;
+            rc = 1;
     }
+    goto out;
 
-    /* Cancel the refill callout to avoid stale timer. */
+out_detach:
+    sched_domain_detach(cur);
+out:
     callout_cancel_sync(&dom.refill_callout);
-
-    return 0;
+    return rc;
 }
 DEFINE_SELFTEST(sched_domain_basic, test_sched_domain_basic);
 
@@ -688,11 +706,13 @@ static i32 test_sched_domain_budget(void)
     /* Wait for the refill callout to fire (period is 50ms). */
     sleep_ms(time_ms_new(80));
 
-    if (__atomic_load_n(&dom.state, __ATOMIC_ACQUIRE) != DOMAIN_ACTIVE ||
-        __atomic_load_n(&dom.consumed_ticks, __ATOMIC_RELAXED) != 0)
-        return 1;
+    bool ok = __atomic_load_n(&dom.state, __ATOMIC_ACQUIRE) == DOMAIN_ACTIVE &&
+              __atomic_load_n(&dom.consumed_ticks, __ATOMIC_RELAXED) == 0;
 
+    /* Cancel before returning on either path: the callout closes over &dom,
+     * which is on this function's stack and would dangle once we unwind.
+     */
     callout_cancel_sync(&dom.refill_callout);
-    return 0;
+    return ok ? 0 : 1;
 }
 DEFINE_SELFTEST(sched_domain_budget, test_sched_domain_budget);
