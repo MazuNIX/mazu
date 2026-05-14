@@ -21,21 +21,29 @@ static i32 test_callout_basic(void)
     /* Arm for 1ms worth of ticks. */
     callout_set_ticks(&c, time_ms_to_ticks(1), selftest_callout_cb, NULL);
 
-    if (!callout_pending(&c))
-        return 1;
+    /* Every exit must drain the callout: it closes over &c on the stack. */
+    i32 rc = 0;
+    if (!callout_pending(&c)) {
+        rc = 1;
+        goto out;
+    }
 
     /* Busy-wait up to 100ms for the callout to fire. */
     u64 start = time_rdtime();
     u64 timeout = time_ms_to_ticks(100);
     while (!selftest_callout_fired) {
-        if (time_rdtime() - start > timeout)
-            return 1; /* timed out */
+        if (time_rdtime() - start > timeout) {
+            rc = 1; /* timed out */
+            goto out;
+        }
     }
 
     if (callout_pending(&c))
-        return 1; /* should have been cleared */
+        rc = 1; /* should have been cleared */
 
-    return 0;
+out:
+    callout_cancel_sync(&c);
+    return rc;
 }
 DEFINE_SELFTEST(callout_basic, test_callout_basic);
 
@@ -93,20 +101,27 @@ static i32 test_callout_ordering(void)
     callout_set_ticks(&c2, time_ms_to_ticks(10), selftest_order_cb,
                       (void *) (uptr) 2);
 
-    /* Wait for all to fire (up to 200ms). */
+    /* Three stack-local callouts must all be drained before unwinding. */
+    i32 rc = 0;
     u64 start = time_rdtime();
     u64 timeout = time_ms_to_ticks(200);
     while (selftest_callout_idx < 3) {
-        if (time_rdtime() - start > timeout)
-            return 1;
+        if (time_rdtime() - start > timeout) {
+            rc = 1;
+            goto out;
+        }
     }
 
     /* Expected order: 2 (10ms), 1 (20ms), 0 (30ms). */
     if (selftest_callout_order[0] != 2 || selftest_callout_order[1] != 1 ||
         selftest_callout_order[2] != 0)
-        return 1;
+        rc = 1;
 
-    return 0;
+out:
+    callout_cancel_sync(&c0);
+    callout_cancel_sync(&c1);
+    callout_cancel_sync(&c2);
+    return rc;
 }
 DEFINE_SELFTEST(callout_ordering, test_callout_ordering);
 
@@ -136,19 +151,26 @@ static i32 test_callout_rearm(void)
     /* Re-arm for 10ms with second callback before first fires. */
     callout_set_ticks(&c, time_ms_to_ticks(10), selftest_rearm_second_cb, NULL);
 
-    /* Wait up to 100ms. */
+    /* Every exit must drain c: until selftest_rearm_second_fired is true,
+     * the callout is still armed against &c.
+     */
+    i32 rc = 0;
     u64 start = time_rdtime();
     u64 timeout = time_ms_to_ticks(100);
     while (!selftest_rearm_second_fired) {
-        if (time_rdtime() - start > timeout)
-            return 1;
+        if (time_rdtime() - start > timeout) {
+            rc = 1;
+            goto out;
+        }
     }
 
     /* The first callback should never have fired. */
     if (selftest_rearm_first_fired)
-        return 1;
+        rc = 1;
 
-    return 0;
+out:
+    callout_cancel_sync(&c);
+    return rc;
 }
 DEFINE_SELFTEST(callout_rearm, test_callout_rearm);
 
@@ -200,22 +222,27 @@ static i32 test_callout_accuracy(void)
     u64 t0 = time_rdtime();
     callout_set_usec(&c, 10000, selftest_accuracy_cb, NULL); /* 10ms */
 
-    /* Busy-wait up to 100ms.  QEMU SMP with concurrent selftests can
-     * delay timer interrupts significantly.
+    /* Every exit must drain &c: a timed-out callout is still in the kernel
+     * queue, and unwinding here would dangle the pointer.
      */
+    i32 rc = 0;
     u64 timeout = time_ms_to_ticks(100);
     while (selftest_accuracy_fire_time == 0) {
-        if (time_rdtime() - t0 > timeout)
-            return 1; /* timed out; callout never fired */
+        if (time_rdtime() - t0 > timeout) {
+            rc = 1; /* timed out; callout never fired */
+            goto out;
+        }
     }
 
     u64 elapsed_us = time_ticks_to_us(selftest_accuracy_fire_time - t0);
 
     /* Accept [5ms, 80ms] - wide tolerance for QEMU SMP jitter. */
     if (elapsed_us < 5000 || elapsed_us > 80000)
-        return 1;
+        rc = 1;
 
-    return 0;
+out:
+    callout_cancel_sync(&c);
+    return rc;
 }
 DEFINE_SELFTEST(callout_accuracy, test_callout_accuracy);
 
@@ -300,16 +327,23 @@ static i32 test_callout_batch_stress(void)
                           NULL);
     }
 
-    /* Wait up to 200ms for all to fire. */
+    /* Every exit must drain all callouts: each references &batch_co[i] on
+     * this function's stack.
+     */
+    i32 rc = 0;
     u64 start = time_rdtime();
     u64 timeout = time_ms_to_ticks(200);
     while (__atomic_load_n(&selftest_batch_count, __ATOMIC_RELAXED) <
            BATCH_STRESS_COUNT) {
-        if (time_rdtime() - start > timeout)
-            return 1;
+        if (time_rdtime() - start > timeout) {
+            rc = 1;
+            break;
+        }
     }
 
-    return 0;
+    for (int i = 0; i < BATCH_STRESS_COUNT; i++)
+        callout_cancel_sync(&batch_co[i]);
+    return rc;
 }
 DEFINE_SELFTEST(callout_batch_stress, test_callout_batch_stress);
 
@@ -384,10 +418,13 @@ static i32 test_merged_deadline(void)
      * Accept the test if either the counter incremented OR the callout
      * actually fired (proving the infrastructure works).
      */
-    if (w1 <= w0 && !selftest_callout_fired)
-        return 1;
+    i32 rc = (w1 <= w0 && !selftest_callout_fired) ? 1 : 0;
 
-    return 0;
+    /* If the callout never fired (timeout path) it is still queued against
+     * &c; drain it before unwinding.
+     */
+    callout_cancel_sync(&c);
+    return rc;
 }
 DEFINE_SELFTEST(merged_deadline, test_merged_deadline);
 
@@ -422,23 +459,30 @@ static i32 test_equal_deadline_stability(void)
     callout_set_ticks(&c0, delay, eq_deadline_cb, (void *) (uptr) 0);
     callout_set_ticks(&c1, delay, eq_deadline_cb, (void *) (uptr) 1);
 
-    /* Wait for both to fire. */
+    /* Every exit must drain both callouts: each references its &c on this
+     * stack frame.
+     */
+    i32 rc = 0;
     u64 start = time_rdtime();
     u64 timeout = time_ms_to_ticks(200);
     while (eq_deadline_idx < 2) {
-        if (time_rdtime() - start > timeout)
-            return 1;
+        if (time_rdtime() - start > timeout) {
+            rc = 1;
+            goto out;
+        }
     }
 
     /* Both must have fired. */
     if (eq_deadline_order[0] == -1 || eq_deadline_order[1] == -1)
-        return 1;
-
+        rc = 1;
     /* FIFO stability: c0 armed first, should fire first. */
-    if (eq_deadline_order[0] != 0 || eq_deadline_order[1] != 1)
-        return 1;
+    else if (eq_deadline_order[0] != 0 || eq_deadline_order[1] != 1)
+        rc = 1;
 
-    return 0;
+out:
+    callout_cancel_sync(&c0);
+    callout_cancel_sync(&c1);
+    return rc;
 }
 DEFINE_SELFTEST(equal_deadline_stability, test_equal_deadline_stability);
 
@@ -455,8 +499,15 @@ static i32 test_clockevent_mode(void)
     callout_init(&c);
     callout_set_ticks(&c, time_ms_to_ticks(500), selftest_callout_cb, NULL);
 
-    if (pc->clockevent_mode != CLOCKEVENT_ONESHOT)
-        return 1;
+    /* Drain on every exit: the first assertion may fail while c is still
+     * armed, and even after the in-line callout_cancel below an in-flight
+     * callback could race the function return.
+     */
+    i32 rc = 0;
+    if (pc->clockevent_mode != CLOCKEVENT_ONESHOT) {
+        rc = 1;
+        goto out;
+    }
 
     callout_cancel(&c);
 
@@ -466,9 +517,11 @@ static i32 test_clockevent_mode(void)
      */
     if (pc->clockevent_mode != CLOCKEVENT_SHUTDOWN &&
         pc->clockevent_mode != CLOCKEVENT_ONESHOT)
-        return 1;
+        rc = 1;
 
-    return 0;
+out:
+    callout_cancel_sync(&c);
+    return rc;
 }
 DEFINE_SELFTEST(clockevent_mode, test_clockevent_mode);
 
